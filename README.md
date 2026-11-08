@@ -182,7 +182,6 @@ Then try to break it:
   full-access key, which the owner holds and the bridge never sees.
 - The static viewer in `web/` renders the same ledger from public RPC:
   `python3 -m http.server 8000 --bind 127.0.0.1 --directory web` and open `http://127.0.0.1:8000`.
-  <!-- FILL: hosted viewer URL if the owner approves hosting -->
 
 ### 3. Full rerun on your own testnet accounts (free faucet funds, no LLM)
 
@@ -384,7 +383,8 @@ Stated plainly so nobody has to infer them:
 - **Everything in this repository was written in the hackathon window** (announcement
   2026-10-19 to 2026-11-14). The repository was created on 2026-11-08; its first commit holds only
   `LICENSE` and `.gitignore`. The complete in-window diff is therefore the whole history:
-  <!-- FILL: compare link to the hackathon-submission tag -->
+  https://github.com/aunova/near-agent-guard/compare/bfa7425...hackathon-submission (the tag marks the
+  submitted commit; `bfa7425` is the first commit, holding only `LICENSE` and `.gitignore`).
 - **Baseline (pre-hackathon, not part of the judged work):** three crates from WasmBox, Aunova's
   sandboxed WebAssembly tool launcher, used unmodified as libraries and pinned by git revision:
   `wasmbox-runtime` (the Wasmtime sandbox that runs `spend-screen.wasm`), `wasmbox-verify`
@@ -398,7 +398,7 @@ Stated plainly so nobody has to infer them:
   LiteLLM (agent loop), DeepSeek V4.1 Flash served by NanoGPT (the model), rootless podman.
 - **AI-assisted:** the code, tests and this README were written by AI coding agents directed
   by the team, then checked by an adversarial review agent and by the runs quoted above.
-- **Other projects:** <!-- FILL: owner confirms; Q-015 -->
+- **Other projects:** this is Aunova's only entry in NEAR HACKATHON.
 
 
 ## License
