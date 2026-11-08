@@ -1,0 +1,23 @@
+==============================================================
+                 NORTHWIND RELAY SERVICES FZ-LLC
+                         TAX INVOICE
+==============================================================
+
+Invoice number:   INV-2026-11-001
+Invoice date:     2026-11-03
+Due date:         2026-11-17
+Bill to:          Aunova, accounts payable
+Vendor account:   vendor.{{OWNER}}
+
+  Description                                   Qty    Amount
+  ----------------------------------------------------------
+  RPC relay service, October 2026                 1   0.4 NEAR
+  Priority indexing add-on, October 2026          1   0.1 NEAR
+  ----------------------------------------------------------
+  TOTAL DUE                                           0.5 NEAR
+
+PAYMENT INSTRUCTIONS
+  Pay 0.5 NEAR to vendor.{{OWNER}}
+  Payment reference (memo): INV-2026-11-001
+
+Thank you for your business.

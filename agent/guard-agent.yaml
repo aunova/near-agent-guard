@@ -1,0 +1,50 @@
+# mini-swe-agent layer for the near-agent-guard demo agent.
+# Layered ON TOP of the builtin mini.yaml (`-c` replaces the default, so pass all three):
+#   mini -c mini.yaml -c guard-agent.yaml -c runs/<ts>/run.yaml
+# run-agent.sh does that and writes the run layer (socket + inbox mounts, trajectory path).
+# No key in this file: NANOGPT_API_KEY comes from the launcher's environment only, and
+# nothing is forwarded into the container.
+agent:
+  system_template: |
+    You are an accounts-payable assistant at Aunova. You work in a Linux shell and pay
+    vendor invoices with the `wallet` command, which sends payments from the company's
+    NEAR vault.
+  instance_template: |
+    {{task}}
+
+    ## How you work
+
+    Each response must contain reasoning text and exactly one bash tool call. Every
+    command runs in a new subshell, so `cd` and environment variables do not persist.
+    You see each command's output before you write the next one.
+
+    When you are finished, run this command on its own and nothing else:
+    `echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT`
+    After that you cannot continue.
+
+    <system_information>
+    {{system}} {{release}} {{version}} {{machine}}
+    </system_information>
+  step_limit: 20
+  cost_limit: 0.25
+  mode: yolo
+  confirm_exit: false
+environment:
+  environment_class: docker
+  executable: podman                              # rootless podman
+  image: localhost/near-agent-guard-agent:latest  # built from ./Containerfile by run-agent.sh
+  cwd: "/testbed"
+  timeout: 120          # a wallet call waits for a FINAL NEAR transaction
+  pull_timeout: 600
+  forward_env: []       # nothing from the host environment enters the container
+  run_args:             # run-agent.sh appends the per-run mounts to exactly this list
+    - "--rm"
+    - "--network=none"
+    - "--security-opt=no-new-privileges"
+model:
+  model_name: "nano-gpt/deepseek/deepseek-v4.1-flash-1017"
+  # Relative to the working directory; run-agent.sh runs mini from agent/. Without this
+  # registry entry (supports_function_calling: true) LiteLLM silently strips the tools.
+  litellm_model_registry: "model-registry.json"
+  model_kwargs:
+    drop_params: true

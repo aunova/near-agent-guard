@@ -5,3 +5,5 @@ target/
 runs/
 .near-credentials/
 node_modules/
+*.env
+.qa/

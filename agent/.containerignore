@@ -1,0 +1,3 @@
+# The image needs only the wallet; keep runs/ (trajectories, live sockets) out of the build context.
+*
+!wallet

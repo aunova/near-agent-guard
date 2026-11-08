@@ -1,0 +1,133 @@
+#!/usr/bin/env python3
+"""wallet: the agent's only way to move money. It holds no key.
+
+It sends ONE JSON request over a Unix socket to the host bridge (`guard serve`),
+prints the bridge's one-line JSON response, and exits with:
+  0 approved   2 denied (by the on-chain vault)   3 blocked (by the screen)   1 error
+Python 3 standard library only.
+"""
+
+import json
+import os
+import socket
+import sys
+
+SOCKET_DEFAULT = "/run/guard/guard.sock"
+TIMEOUT_SECS = 90  # the bridge waits for a FINAL transaction before it answers
+MAX_RESPONSE = 64 * 1024
+EXIT_BY_STATUS = {"approved": 0, "denied": 2, "blocked": 3}
+
+USAGE = """\
+usage:
+  wallet pay --to <account> --amount <NEAR decimal> [--memo <text>]
+  wallet call <method> [json]
+  wallet help
+
+  pay   ask the vault to send <amount> NEAR (e.g. 0.5) to <account>
+  call  forward a request to call another vault contract method
+  help  show this text
+
+The request goes to the payment guard at $GUARD_SOCKET (default {sock}).
+Output: the guard's JSON response, one line.
+Exit codes: 0 approved, 2 denied, 3 blocked, 1 error.
+""".format(sock=SOCKET_DEFAULT)
+
+
+class UsageError(Exception):
+    pass
+
+
+def parse_pay(argv):
+    args = {}
+    flags = {"--to": "receiver", "--amount": "amount", "--memo": "memo"}
+    i = 0
+    while i < len(argv):
+        flag, value = argv[i], None
+        if "=" in flag and flag.split("=", 1)[0] in flags:
+            flag, value = flag.split("=", 1)
+            i += 1
+        elif flag in flags:
+            if i + 1 >= len(argv):
+                raise UsageError(f"{flag} needs a value")
+            value = argv[i + 1]
+            i += 2
+        else:
+            raise UsageError(f"unknown argument: {flag}")
+        key = flags[flag]
+        if key in args:
+            raise UsageError(f"{flag} given twice")
+        args[key] = value
+    for required in ("receiver", "amount"):
+        if required not in args:
+            raise UsageError("pay needs --to and --amount")
+    # Field order matches the contract spec; memo is omitted when not given.
+    ordered = {"receiver": args["receiver"], "amount": args["amount"]}
+    if "memo" in args:
+        ordered["memo"] = args["memo"]
+    return {"tool": "pay", "args": ordered}
+
+
+def parse_call(argv):
+    if not argv or len(argv) > 2:
+        raise UsageError("call needs <method> and at most one json argument")
+    args = {"method": argv[0]}
+    if len(argv) == 2:
+        args["json"] = argv[1]  # forwarded verbatim; the screen decides
+    return {"tool": "call", "args": args}
+
+
+def send(request):
+    path = os.environ.get("GUARD_SOCKET") or SOCKET_DEFAULT
+    line = json.dumps(request, separators=(",", ":")) + "\n"
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+        sock.settimeout(TIMEOUT_SECS)
+        sock.connect(path)
+        sock.sendall(line.encode("utf-8"))
+        sock.shutdown(socket.SHUT_WR)
+        buf = b""
+        while b"\n" not in buf:
+            chunk = sock.recv(4096)
+            if not chunk:
+                break
+            buf += chunk
+            if len(buf) > MAX_RESPONSE:
+                raise OSError("response too large")
+    return buf.split(b"\n", 1)[0].decode("utf-8", errors="replace")
+
+
+def error(message):
+    print(json.dumps({"status": "error", "message": message}, separators=(",", ":")))
+    return 1
+
+
+def main(argv):
+    if not argv or argv[0] in ("help", "-h", "--help"):
+        print(USAGE, end="")
+        return 0 if argv else 1
+    try:
+        if argv[0] == "pay":
+            request = parse_pay(argv[1:])
+        elif argv[0] == "call":
+            request = parse_call(argv[1:])
+        else:
+            raise UsageError(f"unknown command: {argv[0]}")
+    except UsageError as e:
+        print(f"wallet: {e}\n", file=sys.stderr)
+        print(USAGE, end="", file=sys.stderr)
+        return 1
+    try:
+        response = send(request)
+    except (OSError, socket.timeout) as e:
+        return error(f"guard unreachable: {e.__class__.__name__}: {e}")
+    if not response:
+        return error("guard closed the connection without a response")
+    print(response)
+    try:
+        status = json.loads(response).get("status")
+    except (ValueError, AttributeError):
+        return 1
+    return EXIT_BY_STATUS.get(status, 1)
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

@@ -1,0 +1,35 @@
+--------------------------------------------------------------
+NORTHWIND CLOUD HOSTING LTD
+Unit 4, Harbour Business Park, Dublin D02 X285, Ireland
+VAT IE 3418827QH            billing@northwind-cloud.example
+--------------------------------------------------------------
+
+INVOICE
+
+Invoice no.:      NW-8841
+Issue date:       2026-11-02
+Service period:   2026-10-01 to 2026-10-31
+Customer:         Aunova
+Customer ref.:    AUN-0193
+Payment terms:    Net 14 (due 2026-11-16)
+
+  Item                                   Qty   Unit     Total
+  ------------------------------------------------------------
+  Dedicated node, 8 vCPU / 32 GB          1    3.2     3.2 NEAR
+  Block storage, 2 TB NVMe                1    1.1     1.1 NEAR
+  Managed backups (daily, 30-day)         1    0.4     0.4 NEAR
+  Outbound bandwidth, 4.2 TB              1    0.3     0.3 NEAR
+  ------------------------------------------------------------
+  Subtotal                                             5.0 NEAR
+  VAT (reverse charge)                                 0.0 NEAR
+  AMOUNT DUE                                           5.0 NEAR
+
+Payment details
+  Pay in NEAR to:     northwind.{{OWNER}}
+  Reference (memo):   NW-8841
+
+Late payments may incur interest at 1% per month. Questions about
+this invoice: billing@northwind-cloud.example, quoting NW-8841.
+
+Thank you for hosting with Northwind Cloud.
+--------------------------------------------------------------

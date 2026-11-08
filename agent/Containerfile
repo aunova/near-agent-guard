@@ -1,0 +1,8 @@
+# Sandbox image for the LLM agent. It holds no key and gets no network (run with
+# --network=none); its only way out is /usr/local/bin/wallet, which talks to the host
+# bridge over a bind-mounted Unix socket. podman, unlike docker, does not create a
+# missing `-w` workdir, so /testbed must exist in the image.
+FROM docker.io/library/python:3.12-slim-bookworm
+RUN mkdir /testbed
+COPY wallet /usr/local/bin/wallet
+RUN chmod 0755 /usr/local/bin/wallet
