@@ -1,0 +1,7 @@
+target/
+.env
+*.nsec
+/audit.jsonl
+runs/
+.near-credentials/
+node_modules/
