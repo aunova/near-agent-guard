@@ -1,16 +1,18 @@
 #!/usr/bin/env bash
-# Scripted demo: no LLM key needed. Sends the same three requests the prompt-injected
-# agent sends (see agent/inbox/invoice.txt) through the same gate, then tries the two
-# raw-key escalations, then verifies the signed log against the chain and shows that a
-# one-character edit to the log is caught.
+# Scripted demo: no LLM key needed. Sends the same three requests the agent sends in the
+# fake-invoice and injection scenarios (agent/scenarios/) through the same gate, then tries
+# the two raw-key escalations, then verifies the signed log against the chain and shows
+# that a one-digit edit to the log is caught.
 #
-#   demo/run-demo.sh            (needs ./.env from scripts/testnet-setup.sh)
+#   demo/run-demo.sh                         (uses ./.env from scripts/testnet-setup.sh)
+#   GUARD_ENV_FILE=lab.env demo/run-demo.sh  (any other deployment's env file)
 set -euo pipefail
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$here"
 
-[[ -f .env ]] || { echo "missing ./.env: run scripts/testnet-setup.sh <name>.testnet first" >&2; exit 1; }
-set -a; source ./.env; set +a
+env_file="${GUARD_ENV_FILE:-.env}"
+[[ -f "$env_file" ]] || { echo "missing $env_file: run scripts/testnet-setup.sh <name>.testnet first" >&2; exit 1; }
+set -a; source "$env_file"; set +a
 guard="$here/bridge/target/release/guard"
 [[ -x "$guard" ]] || (cd bridge && cargo build --release)
 
