@@ -26,11 +26,16 @@
 #                     Given to guard only; never to mini.
 # GUARD_CONTRACT_ID must be vault.<owner>; the invoice templates are rendered for that owner
 # (vendor.<owner> is the real payee, northwind.<owner> the attacker's account).
-# Overrides: GUARD_BIN (default bridge/target/release/guard), GUARD_RUNS_DIR (default agent/runs).
+# Overrides: GUARD_BIN (default bridge/target/release/guard), GUARD_RUNS_DIR (default agent/runs),
+# GUARD_SOCK_DIR (default runs/s at the repo root: a short path, so the socket stays under the
+# 108-byte Unix limit however deep GUARD_RUNS_DIR is; each run uses runs/s/<id>/, mode 0700,
+# removed when the run ends).
 #
 # Output: runs/<ts>/ with audit.jsonl (the signed log for this run), trajectory.traj.json,
 # guard.log, run.yaml, deployment.json, the rendered inbox/ and wallet-etc/; then a summary
-# of what the agent tried.
+# of what the agent tried. deployment.json always records how the run ended, even when it
+# failed before starting: "outcome" completed | failed_preflight | failed_setup | agent_error,
+# and "exit_status". measure.sh counts only completed runs in its rates.
 set -euo pipefail
 agent_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 repo="$(dirname "$agent_dir")"
@@ -38,6 +43,7 @@ envfile="${GUARD_ENV_FILE:-$repo/.env}"
 image="localhost/near-agent-guard-agent:latest"
 guard_bin="${GUARD_BIN:-$repo/bridge/target/release/guard}"
 runs="${GUARD_RUNS_DIR:-$agent_dir/runs}"
+sock_root="${GUARD_SOCK_DIR:-$repo/runs/s}"
 guard_vars=(GUARD_CONTRACT_ID AGENT_ACCOUNT_ID AGENT_PRIVATE_KEY GUARD_AUDIT_NSEC
             GUARD_SCREEN_WASM GUARD_SCREEN_SHA256 NEAR_NETWORK NEAR_RPC_URL)
 
@@ -62,6 +68,26 @@ done
 [[ "$wallet_help" =~ ^[a-z]+$ && -f "$agent_dir/wallet-help/$wallet_help.txt" ]] \
   || die "unknown wallet help '$wallet_help'; have: $(ls "$agent_dir/wallet-help" | sed 's/\.txt$//' | tr '\n' ' ')"
 
+# --- run directory and outcome record (from here on, every exit leaves a recorded outcome) --
+mkdir -p "$runs"
+rundir="$(mktemp -d "$runs/$(date -u +%Y%m%dT%H%M%SZ)-XXXX")"
+outcome="failed_preflight"
+sock_dir=""
+guard_pid=""
+finish() {
+  local status=$?
+  if [[ -n "$guard_pid" ]]; then kill "$guard_pid" 2>/dev/null || true; wait "$guard_pid" 2>/dev/null || true; fi
+  [[ -z "$sock_dir" ]] || rm -rf "$sock_dir" || true
+  python3 "$agent_dir/guardrun.py" outcome "$rundir" "$outcome" "$status" "$scenario" "$wallet_help" \
+    || echo "run-agent: could not record the outcome in $rundir/deployment.json" >&2
+  if [[ -f "$rundir/run.yaml" ]]; then
+    echo
+    python3 "$agent_dir/guardrun.py" summary "$rundir" || true
+  fi
+  exit "$status"
+}
+trap finish EXIT
+
 # --- preflight ---------------------------------------------------------------------------
 command -v podman >/dev/null || die "podman not found"
 command -v mini >/dev/null || die "mini-swe-agent not found (uv tool install mini-swe-agent==2.4.6)"
@@ -83,6 +109,7 @@ done
 contract="${guard_env[GUARD_CONTRACT_ID]:-}"
 [[ "$contract" == vault.?* ]] || die "GUARD_CONTRACT_ID must be vault.<owner> (got '${contract}'); set it in $envfile"
 echo "deployment: $contract (env file: $envfile)   scenario: $scenario   wallet help: $wallet_help"
+outcome="failed_setup"
 
 # Rebuild the image whenever the wallet or Containerfile changed (labelled with their hash).
 src_hash="$(cat "$agent_dir/Containerfile" "$agent_dir/wallet" | sha256sum | cut -c1-16)"
@@ -92,14 +119,12 @@ if [[ "$have_hash" != "$src_hash" ]]; then
   podman build -q --label "near-agent-guard.src=$src_hash" -t "$image" "$agent_dir" >/dev/null
 fi
 
-# --- per-run directory and socket -------------------------------------------------------
-mkdir -p "$runs"
-rundir="$(mktemp -d "$runs/$(date -u +%Y%m%dT%H%M%SZ)-XXXX")"
-sock_dir="$rundir/sock"
-mkdir -m 0700 "$sock_dir"
+# --- per-run socket (short path) and run layer ---------------------------------------------
+mkdir -p -m 0700 "$sock_root"
+sock_dir="$(mktemp -d "$sock_root/XXXXXX")"   # mktemp -d creates it mode 0700
 sock="$("$py" "$agent_dir/guardrun.py" layer "$agent_dir/guard-agent.yaml" "$rundir" "$sock_dir" \
   "$agent_dir/scenarios/$scenario" "$agent_dir/task.md" "$contract" "$agent_dir/wallet-help/$wallet_help.txt")"
-(( ${#sock} < 108 )) || die "socket path too long for a Unix socket (${#sock} bytes): $sock"
+(( ${#sock} < 108 )) || die "socket path too long for a Unix socket (${#sock} bytes): $sock; set GUARD_SOCK_DIR shorter"
 
 # --- bridge: guard config only, no LLM key ------------------------------------------------
 (
@@ -109,8 +134,6 @@ sock="$("$py" "$agent_dir/guardrun.py" layer "$agent_dir/guard-agent.yaml" "$run
   exec "$guard_bin" serve --socket "$sock"
 ) >"$rundir/guard.log" 2>&1 &
 guard_pid=$!
-stop_guard() { kill "$guard_pid" 2>/dev/null && wait "$guard_pid" 2>/dev/null || true; }
-trap stop_guard EXIT
 for _ in $(seq 100); do
   [[ -S "$sock" ]] && break
   kill -0 "$guard_pid" 2>/dev/null || die "guard serve exited; see $rundir/guard.log"
@@ -120,6 +143,7 @@ done
 
 # --- agent: LLM key only, no guard secrets; nothing is forwarded into the container -------
 echo "run: $rundir"
+outcome="agent_error"
 status=0
 (
   unset AGENT_PRIVATE_KEY GUARD_AUDIT_NSEC
@@ -129,9 +153,5 @@ status=0
   exec mini -c mini.yaml -c "$agent_dir/guard-agent.yaml" -c "$rundir/run.yaml" \
     -o "$rundir/trajectory.traj.json" </dev/null
 ) || status=$?
-
-stop_guard
-trap - EXIT
-echo
-"$py" "$agent_dir/guardrun.py" summary "$rundir"
-exit "$status"
+if (( status == 0 )) && [[ -s "$rundir/trajectory.traj.json" ]]; then outcome="completed"; fi
+exit "$status"   # finish() stops guard, removes the socket dir, records the outcome, prints the summary
