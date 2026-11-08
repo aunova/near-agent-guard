@@ -11,6 +11,7 @@
 use std::collections::HashMap;
 use std::error::Error as StdError;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use base64::Engine as _;
@@ -85,11 +86,27 @@ pub struct Policy {
     #[serde(deserialize_with = "yocto_string")]
     pub window_limit: u128,
     pub window_secs: u64,
+    /// Most ledger entries the agent may add per window.
+    pub max_entries_per_window: u32,
     pub allowed_receivers: Vec<String>,
     pub revoked: bool,
     pub window_start_ms: u64,
     #[serde(deserialize_with = "yocto_string")]
     pub window_spent: u128,
+    /// Ledger entries added in the current window.
+    pub window_entries: u32,
+}
+
+/// NEAR's storage price: 10^19 yoctoNEAR per byte (1 NEAR per 100 kB).
+const STORAGE_BYTE_COST: u128 = 10_000_000_000_000_000_000;
+
+/// The most yoctoNEAR of the vault's balance one agent can lock as storage stake per window:
+/// `max_entries_per_window` x `max_entry_storage_bytes` x 10^19. `None` if values from the RPC
+/// would overflow `u128`.
+pub fn window_storage_bound(max_entries_per_window: u32, max_entry_storage_bytes: u64) -> Option<u128> {
+    u128::from(max_entries_per_window)
+        .checked_mul(u128::from(max_entry_storage_bytes))?
+        .checked_mul(STORAGE_BYTE_COST)
 }
 
 /// `request_spend` return value.
@@ -255,6 +272,8 @@ fn vault_refusal(panic: &str) -> Option<&'static str> {
         "attempt_id must be exactly 64 lowercase hex characters" => Some("invalid_attempt_id"),
         "memo exceeds 256 bytes" => Some("memo_too_long"),
         "duplicate attempt_id" => Some("duplicate_attempt_id"),
+        "agent revoked" => Some("revoked"),
+        "window entry cap reached" => Some("window_entry_cap"),
         _ if panic.starts_with("unknown agent") => Some("unknown_agent"),
         _ => None,
     }
@@ -267,6 +286,8 @@ pub struct Chain {
     http: reqwest::Client,
     contract: AccountId,
     agent: AccountId,
+    /// Set once the RPC's `status` reported chain_id `testnet`; nothing touches the chain before.
+    testnet_confirmed: AtomicBool,
 }
 
 impl Chain {
@@ -282,6 +303,7 @@ impl Chain {
             http,
             contract,
             agent,
+            testnet_confirmed: AtomicBool::new(false),
         })
     }
 
@@ -301,6 +323,13 @@ impl Chain {
     /// waited on until FINAL so the transfer callback has settled; then the ledger entry is read
     /// back for the transfer status.
     pub async fn request_spend(&self, signer: &Arc<Signer>, intent: &PayIntent, attempt_id: &str) -> SpendOutcome {
+        if let Err(message) = self.ensure_testnet().await {
+            return SpendOutcome::Failed {
+                tx_hash: None,
+                reasons: Vec::new(),
+                message,
+            };
+        }
         let args = json!({
             "receiver": intent.receiver,
             "amount": intent.amount_yocto.to_string(),
@@ -376,6 +405,9 @@ impl Chain {
 
     /// Signs and posts one breakout attempt with the function-call key.
     pub async fn attack(&self, signer: &Arc<Signer>, kind: AttackKind, attacker: &AccountId) -> AttackOutcome {
+        if let Err(message) = self.ensure_testnet().await {
+            return AttackOutcome::Error(message);
+        }
         let transaction = match kind {
             AttackKind::Escalate | AttackKind::EscalateWithDeposit => Contract(self.contract.clone())
                 .call_function("set_policy", escalate_args(&self.agent, attacker))
@@ -418,6 +450,11 @@ impl Chain {
 
     pub async fn policy(&self) -> Result<Option<Policy>, String> {
         self.view("get_policy", json!({ "agent": self.agent })).await
+    }
+
+    /// Most storage, in bytes, one recorded ledger entry can add.
+    pub async fn max_entry_storage_bytes(&self) -> Result<u64, String> {
+        self.view("max_entry_storage_bytes", json!({})).await
     }
 
     pub async fn vault_available(&self) -> Result<u128, String> {
@@ -473,7 +510,37 @@ impl Chain {
         None
     }
 
+    /// Refuses to go on unless the RPC's own `status` reports chain_id `testnet`: `NEAR_NETWORK`
+    /// alone cannot stop a `NEAR_RPC_URL` that points at mainnet. Checked once per process.
+    async fn ensure_testnet(&self) -> Result<(), String> {
+        if self.testnet_confirmed.load(Ordering::Relaxed) {
+            return Ok(());
+        }
+        let body = serde_json::to_vec(&json!({"jsonrpc": "2.0", "id": "guard", "method": "status", "params": []}))
+            .map_err(|_| "cannot encode the status request".to_owned())?;
+        let reply = match timeout(VIEW_DEADLINE, self.post(&body)).await {
+            Err(_) => return Err(format!("status: no answer from {} within {} s", self.rpc.label, VIEW_DEADLINE.as_secs())),
+            Ok(Err(Post::Retry(message) | Post::Fatal(message))) => {
+                return Err(format!("cannot confirm the RPC is testnet: {message}"));
+            }
+            Ok(Ok(reply)) => reply,
+        };
+        match reply.pointer("/result/chain_id").and_then(Value::as_str) {
+            Some("testnet") => {
+                self.testnet_confirmed.store(true, Ordering::Relaxed);
+                Ok(())
+            }
+            Some(other) => Err(format!(
+                "{} reports chain_id {}; near-agent-guard runs on testnet only and refuses it",
+                self.rpc.label,
+                clip(other)
+            )),
+            None => Err(format!("{} answered status without a chain_id; refusing", self.rpc.label)),
+        }
+    }
+
     async fn view<T: DeserializeOwned + Send + Sync + 'static>(&self, method: &str, args: Value) -> Result<T, String> {
+        self.ensure_testnet().await?;
         let request = Contract(self.contract.clone())
             .call_function(method, args)
             .read_only::<T>()
@@ -896,11 +963,23 @@ mod tests {
         assert_eq!(entry.amount, 500_000_000_000_000_000_000_000);
         let policy: Policy = serde_json::from_str(
             r#"{"per_tx_max":"500000000000000000000000","window_limit":"1000000000000000000000000","window_secs":86400,
-                "allowed_receivers":["vendor.aunova-guard.testnet"],"revoked":false,"window_start_ms":1762600000000,"window_spent":"0"}"#,
+                "max_entries_per_window":200,"allowed_receivers":["vendor.aunova-guard.testnet"],"revoked":false,
+                "window_start_ms":1762600000000,"window_spent":"0","window_entries":3}"#,
         )
         .unwrap();
         assert_eq!(policy.window_limit, 1_000_000_000_000_000_000_000_000);
+        assert_eq!((policy.window_entries, policy.max_entries_per_window), (3, 200));
         assert!(serde_json::from_str::<SpendReceipt>(r#"{"ledger_index":-1,"approved":true,"reasons":[]}"#).is_err());
+    }
+
+    #[test]
+    fn the_window_storage_bound_is_cap_times_bytes_times_the_byte_cost() {
+        // The contract's measured 669 bytes per entry.
+        assert_eq!(window_storage_bound(200, 669).map(format_near).as_deref(), Some("1.338"));
+        assert_eq!(window_storage_bound(1_000, 669).map(format_near).as_deref(), Some("6.69"));
+        assert_eq!(window_storage_bound(1, 1), Some(10_000_000_000_000_000_000));
+        // A lying RPC cannot make the bound wrap.
+        assert_eq!(window_storage_bound(u32::MAX, u64::MAX), None);
     }
 
     #[test]
@@ -931,6 +1010,8 @@ mod tests {
             ("attempt_id must be exactly 64 lowercase hex characters", Some("invalid_attempt_id")),
             ("memo exceeds 256 bytes", Some("memo_too_long")),
             ("duplicate attempt_id", Some("duplicate_attempt_id")),
+            ("agent revoked", Some("revoked")),
+            ("window entry cap reached", Some("window_entry_cap")),
             ("something else", None),
         ] {
             let failure = failure(message);

@@ -10,7 +10,7 @@ use std::sync::Arc;
 use anyhow::{Context, Result, anyhow};
 use clap::{Parser, Subcommand};
 use guard_bridge::audit::{self, AttemptContent, AuditLog, Origin, ResultContent, Status};
-use guard_bridge::chain::{AttackKind, AttackOutcome, Chain, format_near};
+use guard_bridge::chain::{AttackKind, AttackOutcome, Chain, format_near, window_storage_bound};
 use guard_bridge::config;
 use guard_bridge::gate::Gate;
 use guard_bridge::screen::{self, Screen};
@@ -305,6 +305,11 @@ fn policy() -> Result<ExitCode> {
     match policy {
         None => println!("agent {agent}: no policy (unknown agent)"),
         Some(policy) => {
+            let entry_bytes = runtime
+                .block_on(chain.max_entry_storage_bytes())
+                .map_err(|message| anyhow!(message))?;
+            let bound = window_storage_bound(policy.max_entries_per_window, entry_bytes)
+                .map_or_else(|| "beyond u128 (the RPC's values overflow)".to_owned(), |yocto| format!("{} NEAR", format_near(yocto)));
             println!("agent              {agent}");
             println!("per_tx_max         {} NEAR", format_near(policy.per_tx_max));
             println!(
@@ -313,6 +318,14 @@ fn policy() -> Result<ExitCode> {
                 policy.window_secs
             );
             println!("window_spent       {} NEAR", format_near(policy.window_spent));
+            println!(
+                "window_entries     {} of {} used",
+                policy.window_entries, policy.max_entries_per_window
+            );
+            println!(
+                "storage_bound      {bound} per window ({} entries x {entry_bytes} B x 10^19 yoctoNEAR/B)",
+                policy.max_entries_per_window
+            );
             println!("window_start_ms    {}", policy.window_start_ms);
             println!("allowed_receivers  {}", policy.allowed_receivers.join(", "));
             println!("revoked            {}", policy.revoked);

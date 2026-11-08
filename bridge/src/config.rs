@@ -24,7 +24,9 @@ pub struct Rpc {
     pub label: String,
 }
 
-/// Reads `NEAR_NETWORK` (refusing mainnet) and `NEAR_RPC_URL`.
+/// Reads `NEAR_NETWORK` (refusing mainnet) and `NEAR_RPC_URL`. This only checks the names the
+/// operator gave; before anything touches the chain, `Chain` also requires the RPC's own `status`
+/// to report chain_id `testnet`, since a `NEAR_RPC_URL` could point at mainnet regardless.
 pub fn rpc_from_env() -> Result<Rpc> {
     match env::var("NEAR_NETWORK") {
         Ok(network) => check_network(&network)?,
@@ -47,7 +49,7 @@ pub fn rpc_from_env() -> Result<Rpc> {
     })
 }
 
-/// Only `testnet` (the default) is accepted.
+/// Only `testnet` (the default) is accepted as a name; see `rpc_from_env` for the RPC check.
 fn check_network(name: &str) -> Result<()> {
     if name.eq_ignore_ascii_case("mainnet") {
         bail!(MAINNET_REFUSAL);

@@ -6,7 +6,7 @@ use std::collections::{HashMap, HashSet};
 use nostr::EventId;
 use serde_json::Value;
 
-use crate::audit::{Body, LogLine, Status, VerifiedLog, npub};
+use crate::audit::{Body, LogLine, ResultContent, Status, VerifiedLog, npub};
 use crate::chain::{LedgerEntry, format_near, index_ledger};
 use crate::screen::parse_yocto;
 
@@ -124,14 +124,16 @@ pub fn cross_check(logs: &[NamedLog], agent: &str, ledger: &[LedgerEntry], compl
     let by_index = index_ledger(ledger);
     let mut attempts: HashMap<EventId, &LogLine> = HashMap::new();
     let mut answered: HashSet<String> = HashSet::new();
+    let mut results: HashMap<String, &ResultContent> = HashMap::new();
     for named in logs {
         for line in &named.log.lines {
             match &line.body {
                 Body::Attempt(_) => {
                     attempts.insert(line.event.id, line);
                 }
-                Body::Result { attempt, .. } => {
+                Body::Result { attempt, content } => {
                     answered.insert(attempt.to_hex());
+                    results.insert(attempt.to_hex(), content);
                 }
             }
         }
@@ -244,6 +246,39 @@ pub fn cross_check(logs: &[NamedLog], agent: &str, ledger: &[LedgerEntry], compl
         tail_unchecked: 0,
     };
     for entry in agent_entries {
+        // Every entry the logs cover (its attempt id is logged) must have a logged result that
+        // tells the same story: the same ledger index, approved for approved, denied with the same
+        // reasons for denied. A result logged as `error`, or no result at all, while the chain
+        // recorded the spend means the log under-reports it.
+        if logged.contains(&entry.attempt_id) {
+            let disagreement = match results.get(&entry.attempt_id) {
+                None => Some("the logs hold its attempt, but no log has its result".to_owned()),
+                Some(result) => match (result.status, result.ledger_index) {
+                    (_, Some(index)) if index != entry.index => {
+                        Some(format!("its logged result names ledger index {index}"))
+                    }
+                    (Status::Approved, Some(_)) if entry.approved => None,
+                    (Status::Denied, Some(_)) if !entry.approved && result.reasons == entry.reasons => None,
+                    (status, index) => Some(format!(
+                        "its logged result says {} (ledger index {})",
+                        status.as_str(),
+                        index.map_or_else(|| "none".to_owned(), |index| index.to_string())
+                    )),
+                },
+            };
+            if let Some(why) = disagreement {
+                return Err(Mismatch::LedgerIndex {
+                    index: entry.index,
+                    reason: format!(
+                        "attempt {} is on-chain ({} NEAR to {}, approved={}), but {why}",
+                        entry.attempt_id,
+                        format_near(entry.amount),
+                        entry.receiver,
+                        entry.approved
+                    ),
+                });
+            }
+        }
         if complete {
             match anchor {
                 Some((anchor, _)) if entry.index >= anchor => {
@@ -727,6 +762,49 @@ mod tests {
             panic!("the timestamp anchor must catch the cut spend");
         };
         assert_eq!(index, 1);
+    }
+
+    /// Karl's PROBE-C: B timed out waiting for FINAL and was logged as `error`, but it executed and
+    /// paid at ledger 1. Plain verify (no --complete) must fail naming index 1.
+    #[test]
+    fn probe_c_a_spend_logged_as_error_that_the_chain_recorded_fails() {
+        let path = temp("probe-c");
+        let log = AuditLog::open(&path, Keys::generate(), "vault.testnet", AGENT).unwrap();
+        let a = spend(&log, "vendor.testnet", HALF, 0);
+        let b = log.append_attempt(&pay_attempt("vendor.testnet", HALF / 2)).unwrap();
+        let timeout = "no FINAL outcome within 60 s; the transaction may still execute".to_owned();
+        log.append_result(&b, &ResultContent::error(Some("txB".to_owned()), timeout)).unwrap();
+        let c = spend(&log, "vendor.testnet", HALF / 4, 2);
+        let ledger = vec![
+            entry(0, AGENT, &a, "vendor.testnet", HALF, true, &[]),
+            entry(1, AGENT, &b, "vendor.testnet", HALF / 2, true, &[]),
+            entry(2, AGENT, &c, "vendor.testnet", HALF / 4, true, &[]),
+        ];
+        let Err(Mismatch::LedgerIndex { index, reason }) = cross_check(&[named(&path)], AGENT, &ledger, false) else {
+            panic!("an under-reported spend must fail verify");
+        };
+        assert_eq!(index, 1);
+        assert!(reason.contains("its logged result says error"), "{reason}");
+    }
+
+    /// Karl's PROBE-D: B's result never made it to the log (disk full after the spend).
+    #[test]
+    fn probe_d_a_spend_without_a_logged_result_that_the_chain_recorded_fails() {
+        let path = temp("probe-d");
+        let log = AuditLog::open(&path, Keys::generate(), "vault.testnet", AGENT).unwrap();
+        let a = spend(&log, "vendor.testnet", HALF, 0);
+        let b = log.append_attempt(&pay_attempt("vendor.testnet", HALF / 2)).unwrap();
+        let c = spend(&log, "vendor.testnet", HALF / 4, 2);
+        let ledger = vec![
+            entry(0, AGENT, &a, "vendor.testnet", HALF, true, &[]),
+            entry(1, AGENT, &b, "vendor.testnet", HALF / 2, true, &[]),
+            entry(2, AGENT, &c, "vendor.testnet", HALF / 4, true, &[]),
+        ];
+        let Err(Mismatch::LedgerIndex { index, reason }) = cross_check(&[named(&path)], AGENT, &ledger, false) else {
+            panic!("an attempt the chain recorded but the log never resolved must fail verify");
+        };
+        assert_eq!(index, 1);
+        assert!(reason.contains("no log has its result"), "{reason}");
     }
 
     #[test]

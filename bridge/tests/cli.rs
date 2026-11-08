@@ -225,6 +225,36 @@ fn with_a_key_only_the_screened_in_payment_reaches_the_rpc_and_no_url_leaks() {
     assert!(text(&verify).contains("6 events"));
 }
 
+/// An RPC that answers every request with `status` claiming chain_id `mainnet`: whatever
+/// `NEAR_NETWORK` says, `guard` must refuse it before any view or transaction.
+#[test]
+fn an_rpc_reporting_mainnet_is_refused_by_its_chain_id() {
+    let fixture = Fixture::new("chain-id");
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            let mut request = [0u8; 4096];
+            let _ = std::io::Read::read(&mut stream, &mut request);
+            let body = r#"{"jsonrpc":"2.0","id":"guard","result":{"chain_id":"mainnet"}}"#;
+            let reply = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = stream.write_all(reply.as_bytes());
+        }
+    });
+    let output = fixture
+        .guard(&["ledger"])
+        .env("NEAR_RPC_URL", format!("http://127.0.0.1:{port}"))
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let report = text(&output);
+    assert!(report.contains("reports chain_id mainnet") && report.contains("refuses it"), "{report}");
+}
+
 #[test]
 fn mainnet_is_refused_before_anything_is_written() {
     let fixture = Fixture::new("mainnet");

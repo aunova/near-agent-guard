@@ -1,8 +1,11 @@
 //! Hash-chained, signed audit log: one NIP-01 event (kind 4242, BIP-340 signature) per line.
 //!
 //! Events reuse the Nostr format only so `nak verify` can check them; they are never published
-//! to a relay. Each event carries `["prev", <id of the line before>]`, so editing, deleting or
-//! reordering a line breaks the chain at that line even for someone who does not hold the key.
+//! to a relay. Each event carries `["prev", <id of the line before>]`. Editing a line fails that
+//! line's own id check; inserting, reordering or deleting a line breaks the chain at the line
+//! after it, even for someone who does not hold the key. Deleting the last lines leaves no line
+//! after them to break: that is caught only by `guard verify --complete`, which checks the
+//! on-chain ledger for spends the log no longer accounts for.
 
 use std::collections::{HashMap, HashSet};
 use std::fs::OpenOptions;
