@@ -158,8 +158,13 @@ be unaccounted for. Without `--complete`, `verify` checks only the range the log
 Then try to break it:
 
 - Change one digit in `demo/audit.jsonl` (for example `500000000000000000000000` to
-  `900000000000000000000000` on line 1) and run `verify` again: it prints
-  `FAIL line 1: event id does not match its content (edited after signing)` and exits 1.
+  `900000000000000000000000` on line 1) and run `verify --log demo/audit.jsonl` again: it prints
+  `FAIL line 1: event id does not match its content (edited after signing)` and exits 1. With both
+  `--log` files the same failure is reported as `FAIL demo/audit.jsonl line 1: …`.
+- Check who signed. `verify` prints the signing key (`signer npub1…`) and requires every log to have
+  the same one, but it does not compare it with a key you expect. The published logs are signed by
+  `npub1u9w7vddpzpehc98a4madgfnm643agnr3u6lvxjplm7gmge8l480q2v2j7u`; compare that line yourself. A log
+  signed by another key that records no spends would otherwise still pass.
 - Cut the log's tail so the hash chain stays valid but the denied spend disappears:
   `head -n 2 demo/audit.jsonl > cut.jsonl`. Plain `verify --log cut.jsonl` still prints `OK` (with
   `tail not checked`); `verify --complete --log cut.jsonl` prints `FAIL ledger index 1: ... 5 NEAR to
