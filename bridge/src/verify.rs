@@ -1,139 +1,309 @@
-//! `guard verify`: the offline log checks (see `audit::verify_log`) plus, online, a cross-check
-//! of the log against the vault's on-chain ledger in both directions.
+//! `guard verify`: the offline per-file checks (see `audit::verify_log`), the checks across
+//! several log files, and, online, the cross-check of the logs against the vault's ledger.
 
 use std::collections::{HashMap, HashSet};
 
 use nostr::EventId;
 use serde_json::Value;
 
-use crate::audit::{Body, LogLine, Status, VerifiedLog};
+use crate::audit::{Body, LogLine, Status, VerifiedLog, npub};
 use crate::chain::{LedgerEntry, format_near, index_ledger};
 use crate::screen::parse_yocto;
+
+/// One verified log file and the name it is reported under.
+#[derive(Debug)]
+pub struct NamedLog {
+    pub name: String,
+    pub log: VerifiedLog,
+}
+
+/// Clock-skew allowance for the timestamp anchor: a ledger entry stamped up to this long before
+/// the earliest log event still counts as part of the logged run.
+const CLOCK_SKEW_MS: u64 = 120_000;
 
 /// What the online cross-check established.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CrossCheck {
     /// Results whose ledger entry matched.
     pub matched_results: usize,
-    /// Smallest and largest ledger index the log references, if any.
+    /// Smallest and largest ledger index the logs reference, if any.
     pub range: Option<(u64, u64)>,
-    /// This agent's entries inside the range (all of them are in the log).
-    pub agent_entries_in_range: usize,
-    /// This agent's entries outside the range: reported, not failed, since other runs can share
-    /// the vault.
-    pub agent_entries_outside_range: usize,
+    /// Whether every entry from the anchor to the end of the ledger was checked.
+    pub complete: bool,
+    /// With `complete`: the smaller of the first logged index and the first entry for the agent
+    /// stamped no earlier than the earliest log event minus `CLOCK_SKEW_MS`. `None` when neither
+    /// exists (the logs made no spends and nothing happened on-chain since).
+    pub anchor: Option<u64>,
+    /// This agent's entries that were checked and found in the logs.
+    pub checked: usize,
+    /// This agent's entries before the first checked index (earlier runs): reported only.
+    pub before_range: usize,
+    /// This agent's entries after the last logged index, not checked (only without `complete`).
+    pub tail_unchecked: usize,
 }
 
-/// Where the log and the chain disagree.
+/// Where the logs and the chain disagree.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Mismatch {
     /// A result line whose ledger entry is missing or different.
-    Line { line: usize, reason: String },
-    /// A ledger entry for this agent, inside the logged range, that the log omits.
+    Line { file: String, line: usize, reason: String },
+    /// A ledger entry for this agent that the logs do not account for.
     LedgerIndex { index: u64, reason: String },
 }
 
+/// Checks across files: one signer, one contract and agent, and no attempt in two files.
+pub fn check_union(logs: &[NamedLog]) -> Result<(), String> {
+    let Some(first) = logs.first() else {
+        return Err("no audit log given".to_owned());
+    };
+    for named in logs {
+        if named.log.signer != first.log.signer {
+            return Err(format!(
+                "{} is signed by {}, but {} is signed by {}",
+                named.name,
+                npub(&named.log.signer),
+                first.name,
+                npub(&first.log.signer)
+            ));
+        }
+        if named.log.contract != first.log.contract || named.log.agent != first.log.agent {
+            return Err(format!(
+                "{} is for {} / {}, but {} is for {} / {}",
+                named.name, named.log.contract, named.log.agent, first.name, first.log.contract, first.log.agent
+            ));
+        }
+    }
+    let mut seen: HashMap<EventId, &str> = HashMap::new();
+    for named in logs {
+        for line in &named.log.lines {
+            if matches!(line.body, Body::Attempt(_))
+                && let Some(other) = seen.insert(line.event.id, &named.name)
+            {
+                return Err(format!(
+                    "attempt {} appears in both {other} and {}",
+                    line.event.id.to_hex(),
+                    named.name
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Forward: every result with a ledger index matches that entry (attempt id, agent, receiver,
-/// amount, approved, reasons). Reverse: with lo/hi the smallest/largest referenced index, every
-/// entry for `agent` in [lo, hi] carries an attempt id that is in this log. Entries for `agent`
-/// outside [lo, hi] are only counted.
-pub fn cross_check(log: &VerifiedLog, agent: &str, ledger: &[LedgerEntry]) -> Result<CrossCheck, Mismatch> {
+/// amount, approved, reasons). Reverse, with lo/hi the smallest/largest referenced index over all
+/// files: every entry for `agent` in [lo, hi] carries an attempt id that is in the logs. With
+/// `complete`, every entry for `agent` from the anchor (see `CrossCheck::anchor`) to the end of
+/// the ledger must instead be covered by a logged result: that catches a log whose last attempts
+/// were cut off, down to a log cut to its first attempt. Earlier entries are only counted.
+pub fn cross_check(logs: &[NamedLog], agent: &str, ledger: &[LedgerEntry], complete: bool) -> Result<CrossCheck, Mismatch> {
     let by_index = index_ledger(ledger);
-    let attempts: HashMap<EventId, &LogLine> = log
-        .lines
-        .iter()
-        .filter(|line| matches!(line.body, Body::Attempt(_)))
-        .map(|line| (line.event.id, line))
-        .collect();
+    let mut attempts: HashMap<EventId, &LogLine> = HashMap::new();
+    let mut answered: HashSet<String> = HashSet::new();
+    for named in logs {
+        for line in &named.log.lines {
+            match &line.body {
+                Body::Attempt(_) => {
+                    attempts.insert(line.event.id, line);
+                }
+                Body::Result { attempt, .. } => {
+                    answered.insert(attempt.to_hex());
+                }
+            }
+        }
+    }
 
     let mut matched_results = 0;
     let mut range: Option<(u64, u64)> = None;
-    for line in &log.lines {
-        let Body::Result { attempt, content } = &line.body else {
-            continue;
-        };
-        let Some(index) = content.ledger_index else {
-            continue;
-        };
-        let fail = |reason: String| Mismatch::Line { line: line.line, reason };
-        let entry = by_index
-            .get(&index)
-            .ok_or_else(|| fail(format!("ledger entry {index} does not exist on-chain")))?;
-        if entry.attempt_id != attempt.to_hex() {
-            return Err(fail(format!(
-                "ledger entry {index} records attempt {}, not {}",
-                entry.attempt_id,
-                attempt.to_hex()
-            )));
+    for named in logs {
+        for line in &named.log.lines {
+            let Body::Result { attempt, content } = &line.body else {
+                continue;
+            };
+            let Some(index) = content.ledger_index else {
+                continue;
+            };
+            let fail = |reason: String| Mismatch::Line {
+                file: named.name.clone(),
+                line: line.line,
+                reason,
+            };
+            let entry = by_index
+                .get(&index)
+                .ok_or_else(|| fail(format!("ledger entry {index} does not exist on-chain")))?;
+            if entry.attempt_id != attempt.to_hex() {
+                return Err(fail(format!(
+                    "ledger entry {index} records attempt {}, not {}",
+                    entry.attempt_id,
+                    attempt.to_hex()
+                )));
+            }
+            if entry.agent != agent {
+                return Err(fail(format!("ledger entry {index} belongs to {}, not {agent}", entry.agent)));
+            }
+            let (receiver, amount) = attempts
+                .get(attempt)
+                .and_then(|attempt_line| screened_intent(attempt_line))
+                .ok_or_else(|| fail("the result has a ledger index but its attempt was not screened in".to_owned()))?;
+            if entry.receiver != receiver || entry.amount != amount {
+                return Err(fail(format!(
+                    "ledger entry {index} pays {} NEAR to {}, the log screened in {} NEAR to {receiver}",
+                    format_near(entry.amount),
+                    entry.receiver,
+                    format_near(amount)
+                )));
+            }
+            let approved = match content.status {
+                Status::Approved => true,
+                Status::Denied => false,
+                other => return Err(fail(format!("status {} cannot carry a ledger index", other.as_str()))),
+            };
+            if entry.approved != approved {
+                return Err(fail(format!(
+                    "ledger entry {index} says approved={}, the log says {}",
+                    entry.approved,
+                    content.status.as_str()
+                )));
+            }
+            if entry.reasons != content.reasons {
+                return Err(fail(format!(
+                    "ledger entry {index} reasons {:?} differ from the log's {:?}",
+                    entry.reasons, content.reasons
+                )));
+            }
+            matched_results += 1;
+            range = Some(range.map_or((index, index), |(lo, hi)| (lo.min(index), hi.max(index))));
         }
-        if entry.agent != agent {
-            return Err(fail(format!("ledger entry {index} belongs to {}, not {agent}", entry.agent)));
-        }
-        let (receiver, amount) = attempts
-            .get(attempt)
-            .and_then(|attempt_line| screened_intent(attempt_line))
-            .ok_or_else(|| fail("the result has a ledger index but its attempt was not screened in".to_owned()))?;
-        if entry.receiver != receiver || entry.amount != amount {
-            return Err(fail(format!(
-                "ledger entry {index} pays {} NEAR to {}, the log screened in {} NEAR to {receiver}",
-                format_near(entry.amount),
-                entry.receiver,
-                format_near(amount)
-            )));
-        }
-        let approved = match content.status {
-            Status::Approved => true,
-            Status::Denied => false,
-            other => return Err(fail(format!("status {} cannot carry a ledger index", other.as_str()))),
-        };
-        if entry.approved != approved {
-            return Err(fail(format!(
-                "ledger entry {index} says approved={}, the log says {}",
-                entry.approved,
-                content.status.as_str()
-            )));
-        }
-        if entry.reasons != content.reasons {
-            return Err(fail(format!(
-                "ledger entry {index} reasons {:?} differ from the log's {:?}",
-                entry.reasons, content.reasons
-            )));
-        }
-        matched_results += 1;
-        range = Some(range.map_or((index, index), |(lo, hi)| (lo.min(index), hi.max(index))));
     }
 
     let logged: HashSet<String> = attempts.keys().map(EventId::to_hex).collect();
     let mut agent_entries: Vec<&LedgerEntry> = ledger.iter().filter(|entry| entry.agent == agent).collect();
     agent_entries.sort_by_key(|entry| entry.index);
-    let mut in_range = 0;
-    let mut outside = 0;
-    for entry in agent_entries {
-        match range {
-            Some((lo, hi)) if (lo..=hi).contains(&entry.index) => {
-                if !logged.contains(&entry.attempt_id) {
-                    return Err(Mismatch::LedgerIndex {
-                        index: entry.index,
-                        reason: format!(
-                            "{agent} spent under attempt {} ({} NEAR to {}, approved={}), which this log omits",
-                            entry.attempt_id,
-                            format_near(entry.amount),
-                            entry.receiver,
-                            entry.approved
-                        ),
-                    });
-                }
-                in_range += 1;
-            }
-            _ => outside += 1,
+    let anchor = if complete {
+        let earliest_ms = logs
+            .iter()
+            .flat_map(|named| named.log.lines.iter())
+            .map(|line| line.event.created_at.as_secs())
+            .min()
+            .map(|secs| secs.saturating_mul(1000).saturating_sub(CLOCK_SKEW_MS));
+        let by_time = earliest_ms.and_then(|threshold| {
+            agent_entries
+                .iter()
+                .find(|entry| entry.timestamp_ms >= threshold)
+                .map(|entry| entry.index)
+        });
+        match (range.map(|(lo, _)| lo), by_time) {
+            (Some(logged_first), Some(stamped_first)) => Some(logged_first.min(stamped_first)),
+            (logged_first, stamped_first) => logged_first.or(stamped_first),
         }
-    }
-    Ok(CrossCheck {
+    } else {
+        None
+    };
+    let mut check = CrossCheck {
         matched_results,
         range,
-        agent_entries_in_range: in_range,
-        agent_entries_outside_range: outside,
-    })
+        complete,
+        anchor,
+        checked: 0,
+        before_range: 0,
+        tail_unchecked: 0,
+    };
+    for entry in agent_entries {
+        if complete {
+            match anchor {
+                Some(anchor) if entry.index >= anchor => {
+                    if !answered.contains(&entry.attempt_id) {
+                        return Err(Mismatch::LedgerIndex {
+                            index: entry.index,
+                            reason: format!(
+                                "{agent} spent under attempt {} ({} NEAR to {}, approved={}) and no log has its result (truncated?)",
+                                entry.attempt_id,
+                                format_near(entry.amount),
+                                entry.receiver,
+                                entry.approved
+                            ),
+                        });
+                    }
+                    check.checked += 1;
+                }
+                _ => check.before_range += 1,
+            }
+            continue;
+        }
+        let Some((lo, hi)) = range else {
+            check.before_range += 1;
+            continue;
+        };
+        if entry.index < lo {
+            check.before_range += 1;
+        } else if entry.index <= hi {
+            if !logged.contains(&entry.attempt_id) {
+                return Err(Mismatch::LedgerIndex {
+                    index: entry.index,
+                    reason: format!(
+                        "{agent} spent under attempt {} ({} NEAR to {}, approved={}), which the logs omit",
+                        entry.attempt_id,
+                        format_near(entry.amount),
+                        entry.receiver,
+                        entry.approved
+                    ),
+                });
+            }
+            check.checked += 1;
+        } else {
+            check.tail_unchecked += 1;
+        }
+    }
+    Ok(check)
+}
+
+/// The summary `guard verify` prints after a passing cross-check.
+pub fn summary_lines(check: &CrossCheck, agent: &str) -> Vec<String> {
+    let mut lines = vec![format!("ledger   {} logged results match their entries", check.matched_results)];
+    match check.range {
+        _ if check.complete => match check.anchor {
+            Some(anchor) => {
+                lines.push(format!(
+                    "         indexes {anchor}.. to the end of the ledger: all {} entries for {agent} are covered by logged results \
+                     (complete; anchor = first logged index or first entry stamped at most 120 s before the earliest log event)",
+                    check.checked
+                ));
+                lines.push(format!(
+                    "         {} entries for {agent} before index {anchor} (earlier runs): reported, not checked",
+                    check.before_range
+                ));
+            }
+            None => lines.push(format!(
+                "         complete: these logs made no spends and the ledger has no entry for {agent} stamped later than \
+                 120 s before the earliest log event; nothing to check ({} earlier entries reported)",
+                check.before_range
+            )),
+        },
+        Some((lo, hi)) => {
+            lines.push(format!(
+                "         indexes {lo}..={hi}: all {} entries for {agent} are in these logs",
+                check.checked
+            ));
+            lines.push(format!(
+                "         {} entries for {agent} before index {lo} (earlier runs): reported, not checked",
+                check.before_range
+            ));
+            lines.push(format!(
+                "         {} entries for {agent} after index {hi}: tail not checked; use --complete",
+                check.tail_unchecked
+            ));
+        }
+        None => {
+            lines.push(format!(
+                "         these logs reference no ledger index, so nothing anchors the check: {} entries for {agent} reported, not checked",
+                check.before_range
+            ));
+            if !check.complete {
+                lines.push("         tail not checked; use --complete".to_owned());
+            }
+        }
+    }
+    lines
 }
 
 /// Receiver and amount of the payment an attempt's screen verdict let through.
@@ -219,7 +389,7 @@ fn short(text: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
 
     use nostr::Keys;
 
@@ -230,7 +400,7 @@ mod tests {
     const HALF: u128 = 500_000_000_000_000_000_000_000;
 
     fn pay_attempt(receiver: &str, amount: u128) -> AttemptContent {
-        let (raw_request_sha256, raw_request) = describe_raw_request(b"{}");
+        let (raw_request_sha256, raw_request) = describe_raw_request(format!("{receiver}{amount}").as_bytes());
         AttemptContent {
             origin: Origin::Replay,
             raw_request_sha256,
@@ -269,27 +439,41 @@ mod tests {
         }
     }
 
-    /// Log: attempt A approved at ledger 1, attempt B denied at ledger 3.
-    fn sample(path: &Path) -> (VerifiedLog, EventId, EventId) {
-        let _ = std::fs::remove_file(path);
-        let log = AuditLog::open(path, Keys::generate(), "vault.testnet", AGENT).unwrap();
-        let a = log.append_attempt(&pay_attempt("vendor.testnet", HALF)).unwrap();
-        log.append_result(&a, &decided(Status::Approved, 1, &[])).unwrap();
-        let b = log.append_attempt(&pay_attempt("drain.testnet", 10 * HALF)).unwrap();
-        log.append_result(&b, &decided(Status::Denied, 3, &["receiver_not_allowed"])).unwrap();
-        (verify_log(path).unwrap(), a, b)
-    }
-
-    fn temp(name: &str) -> std::path::PathBuf {
+    fn temp(name: &str) -> PathBuf {
         let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("target/unit-tmp")
             .join(format!("verify-{}-{name}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        dir.join("audit.jsonl")
+        let path = dir.join("audit.jsonl");
+        let _ = std::fs::remove_file(&path);
+        path
+    }
+
+    fn named(path: &Path) -> NamedLog {
+        NamedLog {
+            name: path.display().to_string(),
+            log: verify_log(path).unwrap(),
+        }
+    }
+
+    /// Appends one approved payment logged at `index`; returns its attempt id.
+    fn spend(log: &AuditLog, receiver: &str, amount: u128, index: u64) -> EventId {
+        let id = log.append_attempt(&pay_attempt(receiver, amount)).unwrap();
+        log.append_result(&id, &decided(Status::Approved, index, &[])).unwrap();
+        id
     }
 
     fn other() -> EventId {
         EventId::from_hex(&"ee".repeat(32)).unwrap()
+    }
+
+    /// Log: attempt A approved at ledger 1, attempt B denied at ledger 3.
+    fn sample(path: &Path) -> (NamedLog, EventId, EventId) {
+        let log = AuditLog::open(path, Keys::generate(), "vault.testnet", AGENT).unwrap();
+        let a = spend(&log, "vendor.testnet", HALF, 1);
+        let b = log.append_attempt(&pay_attempt("drain.testnet", 10 * HALF)).unwrap();
+        log.append_result(&b, &decided(Status::Denied, 3, &["receiver_not_allowed"])).unwrap();
+        (named(path), a, b)
     }
 
     #[test]
@@ -302,73 +486,168 @@ mod tests {
             entry(3, AGENT, &b, "drain.testnet", 10 * HALF, false, &["receiver_not_allowed"]),
             entry(4, AGENT, &other(), "vendor.testnet", HALF, true, &[]), // a later run
         ];
-        assert_eq!(
-            cross_check(&log, AGENT, &ledger).unwrap(),
-            CrossCheck {
-                matched_results: 2,
-                range: Some((1, 3)),
-                agent_entries_in_range: 2,
-                agent_entries_outside_range: 2,
-            }
-        );
+        let check = cross_check(std::slice::from_ref(&log), AGENT, &ledger, false).unwrap();
+        assert_eq!((check.matched_results, check.range, check.checked), (2, Some((1, 3)), 2));
+        assert_eq!((check.before_range, check.tail_unchecked), (1, 1));
+        // With --complete the later run's entry 4 must be covered too, and it is not.
+        assert!(matches!(
+            cross_check(&[log], AGENT, &ledger, true),
+            Err(Mismatch::LedgerIndex { index: 4, .. })
+        ));
     }
 
     #[test]
-    fn a_spend_inside_the_range_that_the_log_omits_fails_naming_its_index() {
+    fn a_spend_inside_the_range_that_the_logs_omit_fails_naming_its_index() {
         let (log, a, b) = sample(&temp("omitted"));
         let ledger = vec![
             entry(1, AGENT, &a, "vendor.testnet", HALF, true, &[]),
             entry(2, AGENT, &other(), "drain.testnet", HALF, true, &[]),
             entry(3, AGENT, &b, "drain.testnet", 10 * HALF, false, &["receiver_not_allowed"]),
         ];
-        let Err(Mismatch::LedgerIndex { index, reason }) = cross_check(&log, AGENT, &ledger) else {
+        let Err(Mismatch::LedgerIndex { index, reason }) = cross_check(&[log], AGENT, &ledger, false) else {
             panic!("expected a ledger mismatch");
         };
         assert_eq!(index, 2);
-        assert!(reason.contains("which this log omits"), "{reason}");
+        assert!(reason.contains("which the logs omit"), "{reason}");
+    }
+
+    #[test]
+    fn a_truncated_tail_passes_plain_verify_with_a_warning_but_fails_complete() {
+        let path = temp("truncated");
+        let writer = AuditLog::open(&path, Keys::generate(), "vault.testnet", AGENT).unwrap();
+        let a = spend(&writer, "vendor.testnet", HALF, 0);
+        let b = spend(&writer, "vendor.testnet", HALF, 1);
+        let ledger = vec![
+            entry(0, AGENT, &a, "vendor.testnet", HALF, true, &[]),
+            entry(1, AGENT, &b, "vendor.testnet", HALF, true, &[]),
+        ];
+        assert!(cross_check(&[named(&path)], AGENT, &ledger, true).is_ok());
+
+        // Drop the last attempt+result: the remaining prev chain is intact, so the file verifies.
+        let text = std::fs::read_to_string(&path).unwrap();
+        let kept: Vec<&str> = text.lines().take(2).collect();
+        std::fs::write(&path, kept.join("\n") + "\n").unwrap();
+        let truncated = named(&path);
+
+        let plain = cross_check(std::slice::from_ref(&truncated), AGENT, &ledger, false).unwrap();
+        assert_eq!(plain.tail_unchecked, 1);
+        let summary = summary_lines(&plain, AGENT).join("\n");
+        assert!(summary.contains("tail not checked; use --complete"), "{summary}");
+
+        let Err(Mismatch::LedgerIndex { index, reason }) = cross_check(&[truncated], AGENT, &ledger, true) else {
+            panic!("--complete must catch the dropped spend");
+        };
+        assert_eq!(index, 1);
+        assert!(reason.contains("no log has its result"), "{reason}");
+    }
+
+    #[test]
+    fn two_logs_over_one_ledger_verify_together_and_dropping_one_fails() {
+        let keys = Keys::generate();
+        let first_path = temp("first");
+        let second_path = temp("second");
+        let first = AuditLog::open(&first_path, keys.clone(), "vault.testnet", AGENT).unwrap();
+        let a = spend(&first, "vendor.testnet", HALF, 0);
+        let second = AuditLog::open(&second_path, keys, "vault.testnet", AGENT).unwrap();
+        // A different request: two files started in the same second with the same request would
+        // produce the same attempt id (same key, content, prev and second) and be refused as shared.
+        let b = spend(&second, "vendor.testnet", HALF / 2, 1);
+        let ledger = vec![
+            entry(0, AGENT, &a, "vendor.testnet", HALF, true, &[]),
+            entry(1, AGENT, &b, "vendor.testnet", HALF / 2, true, &[]),
+        ];
+        let both = [named(&first_path), named(&second_path)];
+        check_union(&both).unwrap();
+        let check = cross_check(&both, AGENT, &ledger, true).unwrap();
+        assert_eq!((check.range, check.checked, check.before_range), (Some((0, 1)), 2, 0));
+
+        let Err(Mismatch::LedgerIndex { index, .. }) = cross_check(&[named(&first_path)], AGENT, &ledger, true) else {
+            panic!("dropping the second log must fail --complete");
+        };
+        assert_eq!(index, 1);
+    }
+
+    #[test]
+    fn logs_from_different_signers_or_sharing_an_attempt_are_refused() {
+        let first_path = temp("signer-a");
+        let second_path = temp("signer-b");
+        let a_keys = Keys::generate();
+        let b_keys = Keys::generate();
+        spend(&AuditLog::open(&first_path, a_keys.clone(), "vault.testnet", AGENT).unwrap(), "vendor.testnet", HALF, 0);
+        spend(&AuditLog::open(&second_path, b_keys.clone(), "vault.testnet", AGENT).unwrap(), "vendor.testnet", HALF, 1);
+        let message = check_union(&[named(&first_path), named(&second_path)]).unwrap_err();
+        assert!(
+            message.contains(&npub(&a_keys.public_key())) && message.contains(&npub(&b_keys.public_key())),
+            "{message}"
+        );
+
+        let copy_path = temp("copy");
+        std::fs::copy(&first_path, &copy_path).unwrap();
+        let message = check_union(&[named(&first_path), named(&copy_path)]).unwrap_err();
+        assert!(message.contains("appears in both"), "{message}");
     }
 
     #[test]
     fn forward_mismatches_name_the_result_line() {
         let (log, a, b) = sample(&temp("forward"));
+        let logs = [log];
         let good_b = entry(3, AGENT, &b, "drain.testnet", 10 * HALF, false, &["receiver_not_allowed"]);
-
-        let wrong_amount = vec![entry(1, AGENT, &a, "vendor.testnet", 2 * HALF, true, &[]), good_b.clone()];
-        assert!(matches!(cross_check(&log, AGENT, &wrong_amount), Err(Mismatch::Line { line: 2, .. })));
-
-        let wrong_attempt = vec![entry(1, AGENT, &other(), "vendor.testnet", HALF, true, &[]), good_b.clone()];
-        assert!(matches!(cross_check(&log, AGENT, &wrong_attempt), Err(Mismatch::Line { line: 2, .. })));
-
-        let flipped = vec![entry(1, AGENT, &a, "vendor.testnet", HALF, false, &[]), good_b.clone()];
-        assert!(matches!(cross_check(&log, AGENT, &flipped), Err(Mismatch::Line { line: 2, .. })));
-
-        let missing = vec![good_b];
-        assert!(matches!(cross_check(&log, AGENT, &missing), Err(Mismatch::Line { line: 2, .. })));
-
-        let other_agent = vec![
-            entry(1, "agent2.testnet", &a, "vendor.testnet", HALF, true, &[]),
-            entry(3, AGENT, &b, "drain.testnet", 10 * HALF, false, &["receiver_not_allowed"]),
-        ];
-        assert!(matches!(cross_check(&log, AGENT, &other_agent), Err(Mismatch::Line { line: 2, .. })));
+        for ledger in [
+            vec![entry(1, AGENT, &a, "vendor.testnet", 2 * HALF, true, &[]), good_b.clone()],
+            vec![entry(1, AGENT, &other(), "vendor.testnet", HALF, true, &[]), good_b.clone()],
+            vec![entry(1, AGENT, &a, "vendor.testnet", HALF, false, &[]), good_b.clone()],
+            vec![good_b.clone()],
+            vec![entry(1, "agent2.testnet", &a, "vendor.testnet", HALF, true, &[]), good_b.clone()],
+        ] {
+            assert!(matches!(cross_check(&logs, AGENT, &ledger, false), Err(Mismatch::Line { line: 2, .. })));
+        }
     }
 
     #[test]
-    fn a_log_without_ledger_results_only_counts() {
+    fn logs_without_ledger_results_only_count_and_say_so() {
         let path = temp("no-ledger");
-        let _ = std::fs::remove_file(&path);
         let writer = AuditLog::open(&path, Keys::generate(), "vault.testnet", AGENT).unwrap();
         let a = writer.append_attempt(&pay_attempt("vendor.testnet", HALF)).unwrap();
         writer.append_result(&a, &ResultContent::blocked(vec!["x".to_owned()])).unwrap();
-        let log = verify_log(&path).unwrap();
         let ledger = vec![entry(0, AGENT, &other(), "vendor.testnet", HALF, true, &[])];
-        let check = cross_check(&log, AGENT, &ledger).unwrap();
-        assert_eq!((check.range, check.agent_entries_outside_range), (None, 1));
+        let check = cross_check(&[named(&path)], AGENT, &ledger, false).unwrap();
+        assert_eq!((check.range, check.before_range), (None, 1));
+        assert!(summary_lines(&check, AGENT).join("\n").contains("nothing anchors the check"));
+
+        // --complete with no spend logged and nothing stamped since: passes, and says why.
+        let complete = cross_check(&[named(&path)], AGENT, &ledger, true).unwrap();
+        assert_eq!((complete.anchor, complete.before_range), (None, 1));
+        assert!(summary_lines(&complete, AGENT).join("\n").contains("these logs made no spends"));
+    }
+
+    #[test]
+    fn a_log_cut_to_before_its_first_result_fails_complete_via_the_timestamp_anchor() {
+        let path = temp("cut-to-first-attempt");
+        let writer = AuditLog::open(&path, Keys::generate(), "vault.testnet", AGENT).unwrap();
+        let a = spend(&writer, "vendor.testnet", HALF, 1);
+        // Keep only the first line (the attempt): no result, so no logged ledger index at all.
+        let text = std::fs::read_to_string(&path).unwrap();
+        std::fs::write(&path, format!("{}\n", text.lines().next().unwrap())).unwrap();
+        let truncated = named(&path);
+        let started_ms = truncated.log.lines[0].event.created_at.as_secs() * 1000;
+
+        let mut earlier_run = entry(0, AGENT, &other(), "vendor.testnet", HALF, true, &[]);
+        earlier_run.timestamp_ms = started_ms - CLOCK_SKEW_MS - 1_000; // outside the allowance
+        let mut this_run = entry(1, AGENT, &a, "vendor.testnet", HALF, true, &[]);
+        this_run.timestamp_ms = started_ms + 2_000;
+        let ledger = vec![earlier_run, this_run];
+
+        let Err(Mismatch::LedgerIndex { index, reason }) = cross_check(&[truncated], AGENT, &ledger, true) else {
+            panic!("--complete must not pass a log cut down to its first attempt");
+        };
+        assert_eq!(index, 1);
+        assert!(reason.contains("no log has its result"), "{reason}");
     }
 
     #[test]
     fn rows_list_one_line_per_attempt() {
         let (log, _, _) = sample(&temp("rows"));
-        let rows = attempt_rows(&log);
+        let rows = attempt_rows(&log.log);
         assert_eq!(rows.len(), 3);
         assert!(rows[1].contains("approved") && rows[1].contains("allow 0.5 NEAR to vendor.testnet"), "{}", rows[1]);
         assert!(rows[2].contains("denied") && rows[2].contains("allow 5 NEAR to drain.testnet"), "{}", rows[2]);

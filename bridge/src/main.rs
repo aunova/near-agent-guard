@@ -15,7 +15,7 @@ use guard_bridge::config;
 use guard_bridge::gate::Gate;
 use guard_bridge::screen::{self, Screen};
 use guard_bridge::serve;
-use guard_bridge::verify::{self, Mismatch};
+use guard_bridge::verify::{self, Mismatch, NamedLog};
 use near_api::{AccountId, Signer};
 use nostr::{Keys, ToBech32};
 use tokio::runtime::Runtime;
@@ -49,12 +49,19 @@ enum Command {
     },
     /// Verify the audit log; unless --offline, also cross-check it against the on-chain ledger.
     Verify {
-        /// Log to verify (default: GUARD_AUDIT_LOG, else ./audit.jsonl).
+        /// Log to verify (default: GUARD_AUDIT_LOG, else ./audit.jsonl). Repeat to verify several
+        /// runs on the same vault together: one signer, attempt ids unique across files.
         #[arg(long)]
-        log: Option<PathBuf>,
-        /// Check ids, signatures and the prev chain only; no network.
-        #[arg(long)]
+        log: Vec<PathBuf>,
+        /// Check ids, signatures and the prev chains only; no network.
+        #[arg(long, conflicts_with = "complete")]
         offline: bool,
+        /// Also require every ledger entry for the agent from the anchor to the end of the ledger
+        /// to have a logged result. Anchor: the first logged ledger index, or the first entry for
+        /// the agent stamped at most 120 s (clock-skew allowance) before the earliest log event,
+        /// whichever is smaller. Catches logs whose last attempts were cut off.
+        #[arg(long)]
+        complete: bool,
     },
     /// Print vault ledger entries.
     Ledger {
@@ -100,7 +107,7 @@ fn main() -> ExitCode {
         Command::Keygen => Ok(keygen()),
         Command::Serve { socket } => gate_from_env().and_then(|gate| serve::serve(&socket, &gate)).map(|()| ExitCode::SUCCESS),
         Command::Replay { file } => gate_from_env().and_then(|gate| serve::replay(&file, &gate)).map(|()| ExitCode::SUCCESS),
-        Command::Verify { log, offline } => verify(log, offline),
+        Command::Verify { log, offline, complete } => verify(log, offline, complete),
         Command::Ledger { from, limit } => ledger(from, limit),
         Command::Policy => policy(),
         Command::Attack { kind } => match kind {
@@ -173,29 +180,50 @@ fn gate_from_env() -> Result<Gate> {
     Ok(Gate::new(screen, log, chain, signer, runtime()?))
 }
 
-fn verify(log: Option<PathBuf>, offline: bool) -> Result<ExitCode> {
-    let path = log.unwrap_or_else(config::audit_log_from_env);
-    let verified = match audit::verify_log(&path) {
-        Ok(verified) => verified,
-        Err(bad) if bad.line == 0 => {
-            eprintln!("FAIL {}: {}", path.display(), bad.reason);
-            return Ok(ExitCode::FAILURE);
-        }
-        Err(bad) => {
-            eprintln!("FAIL line {}: {}", bad.line, bad.reason);
-            return Ok(ExitCode::FAILURE);
-        }
+fn verify(logs: Vec<PathBuf>, offline: bool, complete: bool) -> Result<ExitCode> {
+    let paths = if logs.is_empty() {
+        vec![config::audit_log_from_env()]
+    } else {
+        logs
     };
-    for row in verify::attempt_rows(&verified) {
-        println!("{row}");
+    let several = paths.len() > 1;
+    let mut verified = Vec::new();
+    for path in &paths {
+        match audit::verify_log(path) {
+            Ok(log) => verified.push(NamedLog {
+                name: path.display().to_string(),
+                log,
+            }),
+            Err(bad) => {
+                match (bad.line, several) {
+                    (0, _) => eprintln!("FAIL {}: {}", path.display(), bad.reason),
+                    (line, false) => eprintln!("FAIL line {line}: {}", bad.reason),
+                    (line, true) => eprintln!("FAIL {} line {line}: {}", path.display(), bad.reason),
+                }
+                return Ok(ExitCode::FAILURE);
+            }
+        }
     }
-    println!("signer   {}", audit::npub(&verified.signer));
-    println!(
-        "log      {} events, ids and BIP-340 signatures valid, prev chain intact, contract {}, agent {}",
-        verified.lines.len(),
-        verified.contract,
-        verified.agent
-    );
+    for named in &verified {
+        if several {
+            println!("== {}", named.name);
+        }
+        for row in verify::attempt_rows(&named.log) {
+            println!("{row}");
+        }
+        println!(
+            "log      {} events, ids and BIP-340 signatures valid, prev chain intact, contract {}, agent {}",
+            named.log.lines.len(),
+            named.log.contract,
+            named.log.agent
+        );
+    }
+    if let Err(message) = verify::check_union(&verified) {
+        eprintln!("FAIL {message}");
+        return Ok(ExitCode::FAILURE);
+    }
+    let first = &verified[0].log;
+    println!("signer   {}", audit::npub(&first.signer));
     if offline {
         println!("OK (offline: the on-chain ledger was not consulted)");
         return Ok(ExitCode::SUCCESS);
@@ -203,11 +231,11 @@ fn verify(log: Option<PathBuf>, offline: bool) -> Result<ExitCode> {
 
     let chain = chain_from_env()?;
     let agent = chain.agent().clone();
-    if chain.contract().as_str() != verified.contract || agent.as_str() != verified.agent {
+    if chain.contract().as_str() != first.contract || agent.as_str() != first.agent {
         eprintln!(
-            "FAIL the log is for contract {} / agent {}, but GUARD_CONTRACT_ID / AGENT_ACCOUNT_ID are {} / {agent}",
-            verified.contract,
-            verified.agent,
+            "FAIL the logs are for contract {} / agent {}, but GUARD_CONTRACT_ID / AGENT_ACCOUNT_ID are {} / {agent}",
+            first.contract,
+            first.agent,
             chain.contract()
         );
         return Ok(ExitCode::FAILURE);
@@ -215,29 +243,20 @@ fn verify(log: Option<PathBuf>, offline: bool) -> Result<ExitCode> {
     let ledger = runtime()?
         .block_on(chain.full_ledger())
         .map_err(|message| anyhow!(message))?;
-    match verify::cross_check(&verified, agent.as_str(), &ledger) {
+    println!("chain    {} ledger entries read from {}", ledger.len(), chain.endpoint());
+    match verify::cross_check(&verified, agent.as_str(), &ledger, complete) {
         Ok(check) => {
-            println!(
-                "ledger   {} entries read from {}; {} logged results match their entries",
-                ledger.len(),
-                chain.endpoint(),
-                check.matched_results
-            );
-            match check.range {
-                Some((lo, hi)) => println!(
-                    "         indexes {lo}..={hi}: all {} entries for {agent} are in this log",
-                    check.agent_entries_in_range
-                ),
-                None => println!("         this log references no ledger index"),
+            for line in verify::summary_lines(&check, agent.as_str()) {
+                println!("{line}");
             }
-            println!(
-                "         {} entries for {agent} lie outside that range (other runs; reported, not checked)",
-                check.agent_entries_outside_range
-            );
             println!("OK");
             Ok(ExitCode::SUCCESS)
         }
-        Err(Mismatch::Line { line, reason }) => {
+        Err(Mismatch::Line { file, line, reason }) if several => {
+            eprintln!("FAIL {file} line {line}: {reason}");
+            Ok(ExitCode::FAILURE)
+        }
+        Err(Mismatch::Line { line, reason, .. }) => {
             eprintln!("FAIL line {line}: {reason}");
             Ok(ExitCode::FAILURE)
         }
