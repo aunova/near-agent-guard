@@ -1,6 +1,7 @@
 # near-agent-guard
 
-An AI agent gets a NEAR wallet but never a key that can drain it. A NEAR contract enforces
+An AI agent gets a NEAR wallet, but its only key can just ask a vault contract to pay allowlisted
+payees, a bounded amount per window, until the owner revokes it. A NEAR contract enforces
 per-agent spending limits and a receiver allowlist. A NEAR function-call access key keeps the
 agent away from everything else. A WasmBox sandbox parses what the agent asks for. Every
 attempt is signed into an audit log; every spend that reaches the contract is also recorded
