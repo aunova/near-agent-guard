@@ -1,0 +1,53 @@
+[package]
+name = "guard-bridge"
+version = "0.1.0"
+edition = "2024"
+publish = false
+license = "MIT"
+description = "guard: screens an AI agent's wallet requests in WasmBox, signs them into an audit log, then calls the NEAR vault"
+
+# Standalone crate: an empty workspace table stops cargo adopting a parent manifest.
+[workspace]
+
+[lib]
+name = "guard_bridge"
+path = "src/lib.rs"
+
+[[bin]]
+name = "guard"
+path = "src/main.rs"
+
+[dependencies]
+# NEAR: parses the ed25519 function-call key, fetches nonce and block hash, builds and signs
+# transactions, runs view calls. Defaults are already empty; keystore/ledger stay off.
+near-api = { version = "0.8.7", default-features = false }
+# near-api is async-only: a current-thread runtime drives it. `time` bounds every chain call.
+tokio = { version = "1", default-features = false, features = ["rt", "time"] }
+# Direct JSON-RPC `send_tx` post, so the access-key error detail in `error.data` survives
+# (near-openapi-client drops it). The same reqwest 0.12 near-api links; no extra features.
+reqwest = { version = "0.12", default-features = false }
+# The signed transaction's wire bytes for that post, exactly as near-api serialises them.
+borsh = "1"
+# `signed_tx_base64` out, `SuccessValue` in.
+base64 = "0.22"
+# RPC URL handling; only scheme, host and port ever reach a message.
+url = "2"
+# Audit events: NIP-01 build, BIP-340 sign and verify. Core crate only, no relay code. 0.44.8 is
+# the house line, `#![forbid(unsafe_code)]`, and patched for RUSTSEC-2026-0216/0219/0225..0230.
+nostr = { version = "0.44.8", default-features = false, features = ["std"] }
+# WasmBox, MIT crates only (never wasmbox-compliance, which is FSL), pinned to the 2026-08-06
+# pre-hackathon commit: the wasmtime runner, the sha256 pin check, and the capability type.
+wasmbox-runtime = { git = "https://tangled.org/metaend.eth.xyz/wasmbox-cli", rev = "21791a97dcf1708952db7e883cebefe61426c737" }
+wasmbox-verify = { git = "https://tangled.org/metaend.eth.xyz/wasmbox-cli", rev = "21791a97dcf1708952db7e883cebefe61426c737" }
+wasmbox-shared = { git = "https://tangled.org/metaend.eth.xyz/wasmbox-cli", rev = "21791a97dcf1708952db7e883cebefe61426c737" }
+# Command line.
+clap = { version = "4", features = ["derive"] }
+# Wire shapes: verdicts, contract JSON, audit content, responses.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# Error context at the binary edge.
+anyhow = "1"
+# `raw_request_sha256`.
+sha2 = "0.10"
+# Wipes our copies of secret env values once parsed.
+zeroize = "1"

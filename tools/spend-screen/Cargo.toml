@@ -1,0 +1,32 @@
+[package]
+name = "spend-screen"
+version = "0.1.0"
+edition = "2024"
+publish = false
+license = "MIT"
+description = "Screens one untrusted agent wallet request and prints one verdict line; runs as a wasm32-wasip2 component inside WasmBox"
+
+# Standalone crate: an empty workspace table stops cargo adopting a parent manifest.
+[workspace]
+
+[lib]
+name = "spend_screen"
+path = "src/lib.rs"
+
+[[bin]]
+name = "spend-screen"
+path = "src/main.rs"
+
+[dependencies]
+# Typed request envelope: derive rejects duplicate and unknown keys, which a `Value` walk silently merges.
+serde = { version = "1", features = ["derive"] }
+# Request JSON in, verdict JSON out. `raw_value` keeps `args` unparsed until the tool name is known.
+serde_json = { version = "1", features = ["raw_value"] }
+
+[profile.release]
+# The bridge pins this artifact's sha256, so keep it small and deterministic.
+opt-level = "s"
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"
