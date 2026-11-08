@@ -3,7 +3,7 @@
 An AI agent gets a NEAR wallet, but its only key can just ask a vault contract to pay allowlisted
 payees, a bounded amount per window, until the owner revokes it. A NEAR contract enforces
 per-agent spending limits and a receiver allowlist. A NEAR function-call access key keeps the
-agent away from everything else. A WasmBox sandbox parses what the agent asks for. Every
+agent away from everything else. A [WasmBox](https://tangled.org/metaend.eth.xyz/wasmbox-cli) sandbox parses what the agent asks for. Every
 attempt is signed into an audit log; every spend that reaches the contract is also recorded
 on-chain under that log entry's id, and `guard verify` checks the two against each other in
 both directions.
@@ -383,13 +383,15 @@ Stated plainly so nobody has to infer them:
 - **Everything in this repository was written in the hackathon window** (announcement
   2026-10-19 to 2026-11-14). The repository was created on 2026-11-08; its first commit holds only
   `LICENSE` and `.gitignore`. The complete in-window diff is therefore the whole history:
-  https://github.com/aunova/near-agent-guard/compare/bfa7425...hackathon-submission (the tag marks the
-  submitted commit; `bfa7425` is the first commit, holding only `LICENSE` and `.gitignore`).
-- **Baseline (pre-hackathon, not part of the judged work):** three crates from WasmBox, Aunova's
-  sandboxed WebAssembly tool launcher, used unmodified as libraries and pinned by git revision:
-  `wasmbox-runtime` (the Wasmtime sandbox that runs `spend-screen.wasm`), `wasmbox-verify`
-  (the sha256 check before every run) and `wasmbox-shared`. Source:
-  `https://tangled.org/metaend.eth.xyz/wasmbox-cli`, rev `21791a97dcf1708952db7e883cebefe61426c737`
+  https://github.com/aunova/near-agent-guard/compare/bfa7425...main (`bfa7425` is the first commit,
+  holding only `LICENSE` and `.gitignore`).
+- **Baseline (pre-hackathon, not part of the judged work):** three crates from
+  [WasmBox](https://tangled.org/metaend.eth.xyz/wasmbox-cli), Aunova's sandboxed WebAssembly tool
+  launcher: it runs a WebAssembly tool with only the capabilities you grant it (here stdin and
+  stdout) and checks the module's sha256 before every run. Used unmodified as libraries and pinned
+  by git revision: `wasmbox-runtime` (the Wasmtime sandbox that runs `spend-screen.wasm`),
+  `wasmbox-verify` (the sha256 check before every run) and `wasmbox-shared`. Source:
+  https://tangled.org/metaend.eth.xyz/wasmbox-cli, rev `21791a97dcf1708952db7e883cebefe61426c737`
   (2026-08-06). These three crates are MIT. WasmBox's separate compliance module is FSL-licensed
   and is **not** used here.
 - **Third-party libraries and tools:** near-sdk 5.30 and near-workspaces 0.24 (contract and its
