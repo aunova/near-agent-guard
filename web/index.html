@@ -1,0 +1,65 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>near-agent-guard: vault ledger</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <header>
+    <h1>near-agent-guard</h1>
+    <p class="sub">An AI agent with a wallet but no key. Every spend it asks for is decided by the vault contract and recorded on-chain, approved or denied.</p>
+    <p class="meta" id="meta"></p>
+  </header>
+
+  <main>
+    <p id="status" class="status" role="status"></p>
+
+    <section class="card" id="policy-card">
+      <h2>Agent policy</h2>
+      <div id="policy"><p class="muted">Loading…</p></div>
+    </section>
+
+    <section class="card">
+      <div class="row-head">
+        <h2>On-chain ledger <span id="ledger-count" class="muted"></span></h2>
+        <button type="button" id="refresh">Refresh</button>
+      </div>
+      <div class="scroll">
+        <table id="ledger">
+          <thead>
+            <tr><th>#</th><th>Time (UTC)</th><th>Receiver</th><th class="num">Amount</th><th>Decision</th><th>Reasons</th><th>Transfer</th><th>Memo</th><th>Attempt</th></tr>
+          </thead>
+          <tbody><tr><td colspan="9" class="muted">Loading…</td></tr></tbody>
+        </table>
+      </div>
+    </section>
+
+    <section class="card">
+      <div class="row-head">
+        <h2>Audit log cross-check</h2>
+        <div class="controls">
+          <button type="button" id="audit-load">Load ./audit.jsonl</button>
+          <label class="file">or pick a file <input type="file" id="audit-file" accept=".jsonl,.json,application/json,text/plain"></label>
+        </div>
+      </div>
+      <p class="note">This panel recomputes each event's NIP-01 id (SHA-256 of its serialisation), checks the <code>prev</code> hash chain, and matches each attempt id against the <code>attempt_id</code> stored in the on-chain ledger entry. It does <strong>not</strong> verify signatures: run <code>guard verify</code> or <code>nak verify</code> for that.</p>
+      <div id="audit-summary"></div>
+      <div class="scroll">
+        <table id="audit" hidden>
+          <thead>
+            <tr><th>Line</th><th>Attempt id</th><th>Origin</th><th>Request (untrusted, as received)</th><th>Screen</th><th>Result</th><th>Reasons</th><th>Ledger</th><th>Tx</th></tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    </section>
+  </main>
+
+  <footer>
+    <p>Read-only: this page only calls view methods over JSON-RPC. Testnet only. No build step, no third-party scripts.</p>
+  </footer>
+  <script src="app.js"></script>
+</body>
+</html>
