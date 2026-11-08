@@ -51,3 +51,10 @@ anyhow = "1"
 sha2 = "0.10"
 # Wipes our copies of secret env values once parsed.
 zeroize = "1"
+
+# Dependencies optimised in dev and test builds; this crate stays debug. Every screen run compiles
+# spend-screen.wasm with wasmtime/Cranelift, and unoptimised that can overrun the 5 s screen
+# deadline when `cargo test` runs several sandboxes in parallel on a busy machine. The deadline
+# itself is not raised.
+[profile.dev.package."*"]
+opt-level = 2

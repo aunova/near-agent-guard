@@ -17,9 +17,33 @@ pub struct NamedLog {
     pub log: VerifiedLog,
 }
 
-/// Clock-skew allowance for the timestamp anchor: a ledger entry stamped up to this long before
-/// the earliest log event still counts as part of the logged run.
+/// Clock-skew allowance for the timestamp fallback anchor: a ledger entry stamped up to this long
+/// before the earliest log event still counts as part of the logged run.
 const CLOCK_SKEW_MS: u64 = 120_000;
+
+/// Which evidence fixed the `--complete` anchor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AnchorSource {
+    /// The smallest ledger index a logged result carries.
+    LoggedResult,
+    /// The first ledger entry for the agent carrying one of these logs' attempt ids.
+    LoggedAttempt,
+    /// Neither exists: the first entry for the agent stamped no earlier than the earliest log
+    /// event minus `CLOCK_SKEW_MS`.
+    Timestamp,
+}
+
+impl AnchorSource {
+    fn describe(self) -> &'static str {
+        match self {
+            Self::LoggedResult => "the first ledger index a logged result carries",
+            Self::LoggedAttempt => "the first ledger entry carrying one of these logs' attempt ids",
+            Self::Timestamp => {
+                "no logged result or attempt is on-chain, so the first entry stamped at most 120 s before the earliest log event"
+            }
+        }
+    }
+}
 
 /// What the online cross-check established.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -30,10 +54,10 @@ pub struct CrossCheck {
     pub range: Option<(u64, u64)>,
     /// Whether every entry from the anchor to the end of the ledger was checked.
     pub complete: bool,
-    /// With `complete`: the smaller of the first logged index and the first entry for the agent
-    /// stamped no earlier than the earliest log event minus `CLOCK_SKEW_MS`. `None` when neither
-    /// exists (the logs made no spends and nothing happened on-chain since).
-    pub anchor: Option<u64>,
+    /// With `complete`: the smaller of the first logged result's index and the first entry
+    /// carrying a logged attempt id; only when neither exists, the timestamp fallback. `None` when
+    /// there is nothing to anchor on (the logs made no spends and nothing happened on-chain since).
+    pub anchor: Option<(u64, AnchorSource)>,
     /// This agent's entries that were checked and found in the logs.
     pub checked: usize,
     /// This agent's entries before the first checked index (earlier runs): reported only.
@@ -180,21 +204,32 @@ pub fn cross_check(logs: &[NamedLog], agent: &str, ledger: &[LedgerEntry], compl
     let mut agent_entries: Vec<&LedgerEntry> = ledger.iter().filter(|entry| entry.agent == agent).collect();
     agent_entries.sort_by_key(|entry| entry.index);
     let anchor = if complete {
-        let earliest_ms = logs
+        let by_result = range.map(|(lo, _)| lo);
+        let by_attempt = agent_entries
             .iter()
-            .flat_map(|named| named.log.lines.iter())
-            .map(|line| line.event.created_at.as_secs())
-            .min()
-            .map(|secs| secs.saturating_mul(1000).saturating_sub(CLOCK_SKEW_MS));
-        let by_time = earliest_ms.and_then(|threshold| {
-            agent_entries
-                .iter()
-                .find(|entry| entry.timestamp_ms >= threshold)
-                .map(|entry| entry.index)
-        });
-        match (range.map(|(lo, _)| lo), by_time) {
-            (Some(logged_first), Some(stamped_first)) => Some(logged_first.min(stamped_first)),
-            (logged_first, stamped_first) => logged_first.or(stamped_first),
+            .find(|entry| logged.contains(&entry.attempt_id))
+            .map(|entry| entry.index);
+        match (by_result, by_attempt) {
+            (Some(result), Some(attempt)) if attempt < result => Some((attempt, AnchorSource::LoggedAttempt)),
+            (Some(result), _) => Some((result, AnchorSource::LoggedResult)),
+            (None, Some(attempt)) => Some((attempt, AnchorSource::LoggedAttempt)),
+            (None, None) => {
+                // Spends all cut and the remaining attempts never reached the chain: fall back to
+                // time, with a clock-skew allowance. Never used when the logs themselves anchor,
+                // so an earlier run just before this one is not mistaken for part of it.
+                let threshold = logs
+                    .iter()
+                    .flat_map(|named| named.log.lines.iter())
+                    .map(|line| line.event.created_at.as_secs())
+                    .min()
+                    .map(|secs| secs.saturating_mul(1000).saturating_sub(CLOCK_SKEW_MS));
+                threshold.and_then(|threshold| {
+                    agent_entries
+                        .iter()
+                        .find(|entry| entry.timestamp_ms >= threshold)
+                        .map(|entry| (entry.index, AnchorSource::Timestamp))
+                })
+            }
         }
     } else {
         None
@@ -211,7 +246,7 @@ pub fn cross_check(logs: &[NamedLog], agent: &str, ledger: &[LedgerEntry], compl
     for entry in agent_entries {
         if complete {
             match anchor {
-                Some(anchor) if entry.index >= anchor => {
+                Some((anchor, _)) if entry.index >= anchor => {
                     if !answered.contains(&entry.attempt_id) {
                         return Err(Mismatch::LedgerIndex {
                             index: entry.index,
@@ -262,11 +297,12 @@ pub fn summary_lines(check: &CrossCheck, agent: &str) -> Vec<String> {
     let mut lines = vec![format!("ledger   {} logged results match their entries", check.matched_results)];
     match check.range {
         _ if check.complete => match check.anchor {
-            Some(anchor) => {
+            Some((anchor, source)) => {
                 lines.push(format!(
                     "         indexes {anchor}.. to the end of the ledger: all {} entries for {agent} are covered by logged results \
-                     (complete; anchor = first logged index or first entry stamped at most 120 s before the earliest log event)",
-                    check.checked
+                     (complete; anchor = {})",
+                    check.checked,
+                    source.describe()
                 ));
                 lines.push(format!(
                     "         {} entries for {agent} before index {anchor} (earlier runs): reported, not checked",
@@ -274,8 +310,8 @@ pub fn summary_lines(check: &CrossCheck, agent: &str) -> Vec<String> {
                 ));
             }
             None => lines.push(format!(
-                "         complete: these logs made no spends and the ledger has no entry for {agent} stamped later than \
-                 120 s before the earliest log event; nothing to check ({} earlier entries reported)",
+                "         complete: these logs made no spends, none of their attempts is on-chain, and the ledger has no entry \
+                 for {agent} stamped later than 120 s before the earliest log event; nothing to check ({} earlier entries reported)",
                 check.before_range
             )),
         },
@@ -621,7 +657,28 @@ mod tests {
     }
 
     #[test]
-    fn a_log_cut_to_before_its_first_result_fails_complete_via_the_timestamp_anchor() {
+    fn a_retake_starting_within_the_skew_window_of_an_earlier_run_passes_complete() {
+        let path = temp("retake");
+        let writer = AuditLog::open(&path, Keys::generate(), "vault.testnet", AGENT).unwrap();
+        let a = spend(&writer, "vendor.testnet", HALF, 1);
+        let retake = named(&path);
+        let started_ms = retake.log.lines[0].event.created_at.as_secs() * 1000;
+
+        // Run A's spend, a different attempt id, stamped 30 s before this log starts.
+        let mut earlier_run = entry(0, AGENT, &other(), "vendor.testnet", HALF, true, &[]);
+        earlier_run.timestamp_ms = started_ms - 30_000;
+        let mut this_run = entry(1, AGENT, &a, "vendor.testnet", HALF, true, &[]);
+        this_run.timestamp_ms = started_ms + 2_000;
+        let ledger = vec![earlier_run, this_run];
+
+        let check = cross_check(&[retake], AGENT, &ledger, true).expect("a retake must pass --complete");
+        assert_eq!((check.checked, check.before_range), (1, 1));
+        assert_eq!(check.anchor, Some((1, AnchorSource::LoggedResult)));
+        assert!(summary_lines(&check, AGENT).join("\n").contains("anchor = the first ledger index a logged result carries"));
+    }
+
+    #[test]
+    fn a_log_cut_to_its_first_attempt_fails_complete_because_that_attempt_is_on_chain() {
         let path = temp("cut-to-first-attempt");
         let writer = AuditLog::open(&path, Keys::generate(), "vault.testnet", AGENT).unwrap();
         let a = spend(&writer, "vendor.testnet", HALF, 1);
@@ -631,10 +688,12 @@ mod tests {
         let truncated = named(&path);
         let started_ms = truncated.log.lines[0].event.created_at.as_secs() * 1000;
 
+        // Both entries stamped well before the log starts (a host clock 10 minutes fast), so no
+        // timestamp can anchor this: only the logged attempt id found on-chain does.
         let mut earlier_run = entry(0, AGENT, &other(), "vendor.testnet", HALF, true, &[]);
-        earlier_run.timestamp_ms = started_ms - CLOCK_SKEW_MS - 1_000; // outside the allowance
+        earlier_run.timestamp_ms = started_ms - 1_200_000;
         let mut this_run = entry(1, AGENT, &a, "vendor.testnet", HALF, true, &[]);
-        this_run.timestamp_ms = started_ms + 2_000;
+        this_run.timestamp_ms = started_ms - 600_000;
         let ledger = vec![earlier_run, this_run];
 
         let Err(Mismatch::LedgerIndex { index, reason }) = cross_check(&[truncated], AGENT, &ledger, true) else {
@@ -642,6 +701,32 @@ mod tests {
         };
         assert_eq!(index, 1);
         assert!(reason.contains("no log has its result"), "{reason}");
+    }
+
+    #[test]
+    fn cut_spends_whose_remaining_attempts_never_reached_the_chain_fail_via_the_timestamp_anchor() {
+        let path = temp("timestamp-fallback");
+        let writer = AuditLog::open(&path, Keys::generate(), "vault.testnet", AGENT).unwrap();
+        // An attempt that never reached the chain (screen-blocked), then a spend whose lines are cut.
+        let blocked = writer.append_attempt(&pay_attempt("vendor.testnet", 3)).unwrap();
+        writer.append_result(&blocked, &ResultContent::blocked(vec!["x".to_owned()])).unwrap();
+        let cut = spend(&writer, "vendor.testnet", HALF, 1);
+        let text = std::fs::read_to_string(&path).unwrap();
+        let kept: Vec<&str> = text.lines().take(2).collect();
+        std::fs::write(&path, kept.join("\n") + "\n").unwrap();
+        let truncated = named(&path);
+        let started_ms = truncated.log.lines[0].event.created_at.as_secs() * 1000;
+
+        let mut earlier_run = entry(0, AGENT, &other(), "vendor.testnet", HALF, true, &[]);
+        earlier_run.timestamp_ms = started_ms - CLOCK_SKEW_MS - 1_000; // outside the allowance
+        let mut this_run = entry(1, AGENT, &cut, "vendor.testnet", HALF, true, &[]);
+        this_run.timestamp_ms = started_ms + 2_000;
+        let ledger = vec![earlier_run, this_run];
+
+        let Err(Mismatch::LedgerIndex { index, .. }) = cross_check(&[truncated], AGENT, &ledger, true) else {
+            panic!("the timestamp anchor must catch the cut spend");
+        };
+        assert_eq!(index, 1);
     }
 
     #[test]
