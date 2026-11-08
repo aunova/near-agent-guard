@@ -3,8 +3,8 @@
 // ---- config -------------------------------------------------------------------------------
 // Edit these, or override per visit with ?contract=…&agent=…&rpc=…  (?audit=<url> auto-loads a log).
 const CONFIG = {
-  contractId: "vault.aunova-guard.testnet",
-  agentId: "agent.aunova-guard.testnet",
+  contractId: "vault.aunova-agent-guard.testnet",
+  agentId: "agent.aunova-agent-guard.testnet",
   rpcUrl: "https://rpc.testnet.near.org",
   explorer: "https://testnet.nearblocks.io",
   auditLog: "./audit.jsonl",
@@ -129,7 +129,20 @@ async function view(method, args) {
 }
 
 // ---- policy card -----------------------------------------------------------------------------
-function renderPolicy(policy, available) {
+// NEAR protocol storage price: 10^19 yoctoNEAR per byte (1 NEAR per 100 kB).
+const STORAGE_YOCTO_PER_BYTE = 10n ** 19n;
+
+function worstCaseStorage(maxEntries, entryBytes) {
+  let yocto;
+  try {
+    yocto = BigInt(maxEntries) * BigInt(entryBytes) * STORAGE_YOCTO_PER_BYTE;
+  } catch {
+    return "?";
+  }
+  return el("span", {}, near(yocto), ` (${maxEntries} entries × ${entryBytes} B × 10^19 yoctoNEAR/B)`);
+}
+
+function renderPolicy(policy, available, entryBytes) {
   const box = $("policy");
   box.replaceChildren();
   if (policy === null) {
@@ -143,6 +156,8 @@ function renderPolicy(policy, available) {
     ["Window limit", el("span", {}, near(policy.window_limit), ` per ${formatSecs(policy.window_secs)}`)],
     ["Spent this window", el("span", {}, near(policy.window_spent), ` (window ${formatTime(policy.window_start_ms)} → ${formatTime(windowEnd)} UTC)`)],
     ["Allowed receivers", el("span", {}, ...policy.allowed_receivers.flatMap((r, i) => (i ? [", ", accountLink(r)] : [accountLink(r)])))],
+    ["Ledger entries this window", `${policy.window_entries ?? "?"} of ${policy.max_entries_per_window ?? "?"}`],
+    ["Worst-case storage per window", worstCaseStorage(policy.max_entries_per_window, entryBytes)],
     ["Vault available", available === undefined ? "?" : near(available)],
   ];
   box.append(el("dl", { class: "grid" }, rows.flatMap(([k, v]) => [el("dt", { text: k }), el("dd", {}, v)])));
@@ -183,12 +198,13 @@ function renderLedger() {
 async function loadChain() {
   setStatus(`Reading ${cfg.contractId} via ${new URL(cfg.rpcUrl, location.href).host}…`);
   try {
-    const [policy, available, length] = await Promise.all([
+    const [policy, available, length, entryBytes] = await Promise.all([
       view("get_policy", { agent: cfg.agentId }),
       view("vault_available", {}),
       view("ledger_len", {}),
+      view("max_entry_storage_bytes", {}),
     ]);
-    renderPolicy(policy, available);
+    renderPolicy(policy, available, entryBytes);
     const pages = [];
     for (let from = 0; from < Number(length); from += PAGE) pages.push(view("get_ledger", { from_index: from, limit: PAGE }));
     ledger = (await Promise.all(pages)).flat();
