@@ -59,8 +59,11 @@ sub() { # name amount
   echo "$1 created with $2"
 }
 step "sub-accounts"
-sub "$vault" '5 NEAR'
-sub "$agent" '1 NEAR'
+# 8 NEAR: ~1.7 goes to contract storage, 0.1 is the reserve, so ~6.2 stays spendable and
+# still exceeds the 5 NEAR fake invoice after the 0.5 NEAR real one. The fake invoice is then
+# denied for policy reasons only, never for insufficient_vault_balance.
+sub "$vault" '8 NEAR'
+sub "$agent" '0.6 NEAR'
 sub "$vendor" '0.1 NEAR'
 sub "$attacker" '0.1 NEAR'
 

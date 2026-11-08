@@ -52,12 +52,10 @@ echo "access keys now: $before"
 (( before > 0 )) || { echo "$vault already has 0 access keys (checked over RPC): locked."; exit 0; }
 
 echo "proving the owner recovery path on this code: withdraw 0.01 NEAR to $owner"
-near contract call-function as-transaction "$vault" withdraw json-args '{"amount":"10000000000000000000000"}' \
-  prepaid-gas '30 Tgas' attached-deposit '1 yoctoNEAR' sign-as "$owner" "${net[@]}" sign-with-legacy-keychain send \
-  > /tmp/lock-vault.$$ 2>&1 || true
-grep -E 'Transaction ID|owner_withdraw|panicked|Error' /tmp/lock-vault.$$ || true
-grep -q '"event":"owner_withdraw"' /tmp/lock-vault.$$ || { rm -f /tmp/lock-vault.$$; echo "refusing: withdraw did not emit owner_withdraw" >&2; exit 1; }
-rm -f /tmp/lock-vault.$$
+out="$(near contract call-function as-transaction "$vault" withdraw json-args '{"amount":"10000000000000000000000"}' \
+  prepaid-gas '30 Tgas' attached-deposit '1 yoctoNEAR' sign-as "$owner" "${net[@]}" sign-with-legacy-keychain send 2>&1 || true)"
+grep -E 'Transaction ID|owner_withdraw|panicked|Error' <<<"$out" || true
+grep -q '"event":"owner_withdraw"' <<<"$out" || { echo "refusing: withdraw did not emit owner_withdraw" >&2; exit 1; }
 
 mapfile -t pubs < <(public_keys)
 (( ${#pubs[@]} == before )) || { echo "refusing: key list changed or unreadable (${#pubs[@]} vs $before)" >&2; exit 1; }
