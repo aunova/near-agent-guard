@@ -45,7 +45,7 @@ Three layers, each of which stops something the others do not:
 |---|---|---|---|
 | Agent sandbox | rootless podman, `--network=none`, no env forwarded | the agent reaching the network, the RPC, or any key | the agent's only exit is `wallet`, a socket client |
 | WasmBox screen | `guard` runs `spend-screen.wasm` in WasmBox (stdin/stdout only, sha256 checked before every run) | tools other than `pay`, malformed amounts and accounts, common secret formats in the public memo; the process that holds the key never parses the agent's raw request, only the screen's canonical verdict and the contract's ledger entry | `blocked` responses; signed `attempt` + `result` entries in `audit.jsonl` |
-| Contract + access key | `vault` contract on NEAR testnet; the agent's key may call only `request_spend` | spends over the per-tx cap or the per-window cap, receivers not on the allowlist, revoked agents; and at the protocol level: calling `set_policy`, attaching a deposit, plain transfers | ledger entries with `approved:false` and reasons; protocol errors from `guard attack` |
+| Contract + access key | `vault` contract on NEAR testnet; the agent's key may call only `request_spend` | spends over the per-tx cap or the per-window cap, receivers not on the allowlist, more than `max_entries_per_window` requests per window, revoked agents (refused outright, nothing stored); and at the protocol level: calling `set_policy`, attaching a deposit, plain transfers | ledger entries with `approved:false` and reasons; failed transactions with `window entry cap reached` / `agent revoked`; protocol errors from `guard attack` |
 
 ## Try it
 
@@ -272,7 +272,9 @@ Stated plainly so nobody has to infer them:
 
 - **A prompt-injected agent can still spend inside its policy.** If the attacker's receiver is on
   the allowlist, or the amount is under the caps, the payment goes through. The guard bounds the
-  loss; it does not judge intent.
+  loss; it does not judge intent. Per agent and per window the vault can lose at most
+  `window_limit` in transfers (twice that across a window boundary, see below) plus the storage
+  of `max_entries_per_window` ledger entries.
 - **If the bridge host is compromised**, the attacker gets the function-call key and the audit
   key. Spending is then still bounded by the contract, and every spend still lands in the
   on-chain ledger, but the off-chain log can be forged from then on. The on-chain ledger is the
@@ -289,9 +291,18 @@ Stated plainly so nobody has to infer them:
   the receiver allowlist still apply to every spend.
 - **Memos are public.** They are stored on-chain. The screen rejects memos that look like keys
   or secrets, which stops the obvious exfiltration, not every encoding of it.
-- **Denials cost the agent gas.** A denied spend is a successful transaction (that is how the
-  denial gets on-chain), paid from the agent key's gas allowance. Unknown callers cannot write
-  to the ledger at all: the contract rejects them without storing anything.
+- **Denials cost the agent gas and the vault storage, both bounded.** A denied spend is a
+  successful transaction (that is how the denial gets on-chain), paid from the agent key's gas
+  allowance, and its ledger entry is stored at the vault's expense. Each agent may record at most
+  `max_entries_per_window` entries per window, approved or denied; past that, `request_spend`
+  fails with `window entry cap reached` and stores nothing. One entry takes at most 669 bytes
+  (`max_entry_storage_bytes()` on the contract, measured with a 64-character receiver and a
+  256-byte memo), so with the demo's cap of 50 the storage an agent can make the vault pay for is
+  at most 50 × 669 B = 33,450 B, 0.3345 NEAR at NEAR's storage price of 10^19 yoctoNEAR per byte,
+  per window. Unknown and revoked callers cannot write to the ledger at all: the contract rejects
+  them before storing anything. This bound was added after review found that an earlier version
+  let any accepted key, even a revoked one, turn the vault's balance into storage with denied
+  requests; that version's deployments are retired.
 - **The audit log uses the Nostr event format** (NIP-01 serialisation, BIP-340 Schnorr
   signatures, kind 4242) so that standard tools can verify it. It is never published to relays.
 - **Testnet only.** Nothing here has been audited for mainnet funds.

@@ -79,9 +79,12 @@ if has_code "$vault"; then echo "code already deployed, reusing (init runs only 
   echo "deployed"
 fi
 
-step "policy for $agent: 1 NEAR per tx, 2 NEAR per 24 h, receiver $vendor only"
+# max_entries_per_window 50: at most 50 ledger entries (approved or denied) per agent per window,
+# so the storage a compromised key can make the vault pay for is at most 50 x 669 B = 0.3345 NEAR
+# per window (max_entry_storage_bytes() on the deployed contract reports the 669).
+step "policy for $agent: 1 NEAR per tx, 2 NEAR per 24 h, 50 entries per 24 h, receiver $vendor only"
 near contract call-function as-transaction "$vault" set_policy json-args \
-  "{\"agent\":\"$agent\",\"per_tx_max\":\"1000000000000000000000000\",\"window_limit\":\"2000000000000000000000000\",\"window_secs\":86400,\"allowed_receivers\":[\"$vendor\"]}" \
+  "{\"agent\":\"$agent\",\"per_tx_max\":\"1000000000000000000000000\",\"window_limit\":\"2000000000000000000000000\",\"window_secs\":86400,\"max_entries_per_window\":50,\"allowed_receivers\":[\"$vendor\"]}" \
   prepaid-gas '30 Tgas' attached-deposit '1 yoctoNEAR' sign-as "$owner" "${net[@]}" sign-with-legacy-keychain send >/dev/null
 echo "policy set"
 
