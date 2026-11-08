@@ -44,8 +44,8 @@ Three layers, each of which stops something the others do not:
 | Layer | Where | Stops | Evidence you can produce |
 |---|---|---|---|
 | Agent sandbox | rootless podman, `--network=none`, no env forwarded | the agent reaching the network, the RPC, or any key | the agent's only exit is `wallet`, a socket client |
-| WasmBox screen | `guard` runs `spend-screen.wasm` in WasmBox (stdin/stdout only, sha256 checked before every run) | tools other than `pay`, malformed amounts and accounts, secrets in the public memo; the process that holds the key never parses agent output itself | `blocked` responses; signed `attempt` + `result` entries in `audit.jsonl` |
-| Contract + access key | `vault` contract on NEAR testnet; the agent's key may call only `request_spend` | spends over the per-tx cap or the rolling window cap, receivers not on the allowlist, revoked agents; and at the protocol level: calling `set_policy`, attaching a deposit, plain transfers | ledger entries with `approved:false` and reasons; protocol errors from `guard attack` |
+| WasmBox screen | `guard` runs `spend-screen.wasm` in WasmBox (stdin/stdout only, sha256 checked before every run) | tools other than `pay`, malformed amounts and accounts, common secret formats in the public memo; the process that holds the key never parses the agent's raw request, only the screen's canonical verdict and the contract's ledger entry | `blocked` responses; signed `attempt` + `result` entries in `audit.jsonl` |
+| Contract + access key | `vault` contract on NEAR testnet; the agent's key may call only `request_spend` | spends over the per-tx cap or the per-window cap, receivers not on the allowlist, revoked agents; and at the protocol level: calling `set_policy`, attaching a deposit, plain transfers | ledger entries with `approved:false` and reasons; protocol errors from `guard attack` |
 
 ## Try it
 
@@ -53,8 +53,9 @@ Four levels, from no keys at all to the full LLM agent. Commands run from the re
 
 ### Prerequisites
 
-- Rust 1.94 or newer (tested on 1.99.1) with two targets:
-  `rustup target add wasm32-unknown-unknown wasm32-wasip2`
+- Linux with bash 4 or newer and GNU coreutils (the scripts use `sha256sum` and `mapfile`).
+- Rust 1.95 or newer (tested on 1.99.1; near-sdk 5.30 and near-workspaces 0.24 require 1.95) with
+  two targets: `rustup target add wasm32-unknown-unknown wasm32-wasip2`
 - `cargo-near` 0.23 and `near` CLI (near-cli-rs) 0.31, from their release installers:
   `curl --proto '=https' --tlsv1.2 -LsSf https://github.com/near/cargo-near/releases/latest/download/cargo-near-installer.sh | sh`
   and the same URL pattern for `near-cli-rs`.
@@ -139,7 +140,8 @@ Then try to break it:
   `BjUg36Q2KdoXxLXBRsJVms9mFkmz3qF1guMe4uZh2SEs` (denied spend, a successful transaction that
   moved nothing).
 - Inspect the agent's keys: `near account list-keys agent.aunova-guard.testnet network-config testnet now`
-  shows one function-call key limited to `request_spend` on the vault, and the owner's full-access key.
+  shows one function-call key limited to `request_spend` on the vault, and the agent account's
+  full-access key, which the owner holds and the bridge never sees.
 - The static viewer in `web/` renders the same ledger from public RPC:
   `python3 -m http.server 8000 --bind 127.0.0.1 --directory web` and open `http://127.0.0.1:8000`.
   <!-- FILL: hosted viewer URL if the owner approves hosting -->
@@ -214,6 +216,11 @@ Stated plainly so nobody has to infer them:
   convenience. A real deployment keeps them on a hardware wallet or behind a multisig.
 - **The contract owner is trusted.** The owner sets limits and can raise them. This is not a
   multisig; for production the owner would be a DAO or a multisig account.
+- **The window cap is a fixed window, not a sliding one.** A window of `window_secs` starts at
+  the first request after the previous window has ended, and `window_spent` resets to zero then.
+  An agent that spends the full window limit just before a window ends can spend it again just
+  after, so up to twice the limit can leave across one boundary. The per-transaction cap and
+  the receiver allowlist still apply to every spend.
 - **Memos are public.** They are stored on-chain. The screen rejects memos that look like keys
   or secrets, which stops the obvious exfiltration, not every encoding of it.
 - **Denials cost the agent gas.** A denied spend is a successful transaction (that is how the
