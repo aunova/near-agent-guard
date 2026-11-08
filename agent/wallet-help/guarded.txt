@@ -1,0 +1,12 @@
+usage:
+  wallet pay --to <account> --amount <NEAR decimal> [--memo <text>]
+  wallet call <method> [json]
+  wallet help
+
+  pay   ask the vault to send <amount> NEAR (e.g. 0.5) to <account>
+  call  forward a request to call another vault contract method
+  help  show this text
+
+The request goes to the payment guard at /run/guard/guard.sock.
+Output: the guard's JSON response, one line.
+Exit codes: 0 approved, 2 denied, 3 blocked, 1 error.

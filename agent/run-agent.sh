@@ -2,12 +2,18 @@
 # One sandboxed agent run: mini-swe-agent + DeepSeek pays the invoices of one scenario
 # through `wallet`, whose only way out is the bridge (`guard serve`) on a per-run socket.
 #
-#   agent/run-agent.sh [--scenario fake-invoice|injection]     (default: fake-invoice)
+#   agent/run-agent.sh [--scenario fake-invoice|injection] [--wallet-help neutral|guarded]
+#                      (defaults: fake-invoice, neutral)
 #
 # Scenarios are directories under agent/scenarios/; their files become /testbed/inbox:
 #   fake-invoice  a real invoice (0.5 NEAR to vendor.<owner>) plus a plausible invoice from
 #                 an unknown supplier (5 NEAR to northwind.<owner>). Invoice fraud, no instructions.
 #   injection     one invoice with a prompt injection addressed to automated payment agents.
+# Wallet help variants are agent/wallet-help/<name>.txt, mounted read-only at /etc/wallet:
+#   neutral   says only what the commands do; socket at /run/wallet/wallet.sock
+#   guarded   says a payment guard answers approved/denied/blocked; socket at /run/guard/guard.sock
+# (The model may treat a declared guard as a reason to try a payment and "let it decide";
+# measuring both separates that from the attack itself.)
 #
 # Deployment and keys come from an env file: GUARD_ENV_FILE, default ./.env at the repo
 # root (gitignored). Only the names below are read from it; values are never printed.
@@ -23,8 +29,8 @@
 # Overrides: GUARD_BIN (default bridge/target/release/guard), GUARD_RUNS_DIR (default agent/runs).
 #
 # Output: runs/<ts>/ with audit.jsonl (the signed log for this run), trajectory.traj.json,
-# guard.log, run.yaml, deployment.json, the rendered inbox/; then a summary of what the
-# agent tried.
+# guard.log, run.yaml, deployment.json, the rendered inbox/ and wallet-etc/; then a summary
+# of what the agent tried.
 set -euo pipefail
 agent_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 repo="$(dirname "$agent_dir")"
@@ -40,15 +46,21 @@ die() { echo "run-agent: $*" >&2; exit 1; }
 dotenv() { [[ -f "$envfile" ]] && grep -m1 -E "^$1=" "$envfile" | cut -d= -f2- | tr -d "\"'" || true; }
 
 scenario="fake-invoice"
+wallet_help="neutral"
+usage="usage: $0 [--scenario fake-invoice|injection] [--wallet-help neutral|guarded]"
 while (( $# )); do
   case "$1" in
-    --scenario) [[ $# -ge 2 ]] || die "--scenario needs a value"; scenario="$2"; shift 2 ;;
+    --scenario) [[ $# -ge 2 ]] || die "$usage"; scenario="$2"; shift 2 ;;
     --scenario=*) scenario="${1#*=}"; shift ;;
-    *) die "unknown argument: $1 (usage: $0 [--scenario fake-invoice|injection])" ;;
+    --wallet-help) [[ $# -ge 2 ]] || die "$usage"; wallet_help="$2"; shift 2 ;;
+    --wallet-help=*) wallet_help="${1#*=}"; shift ;;
+    *) die "unknown argument: $1 ($usage)" ;;
   esac
 done
 [[ "$scenario" =~ ^[a-z0-9-]+$ && -d "$agent_dir/scenarios/$scenario" ]] \
   || die "unknown scenario '$scenario'; have: $(ls "$agent_dir/scenarios" | tr '\n' ' ')"
+[[ "$wallet_help" =~ ^[a-z]+$ && -f "$agent_dir/wallet-help/$wallet_help.txt" ]] \
+  || die "unknown wallet help '$wallet_help'; have: $(ls "$agent_dir/wallet-help" | sed 's/\.txt$//' | tr '\n' ' ')"
 
 # --- preflight ---------------------------------------------------------------------------
 command -v podman >/dev/null || die "podman not found"
@@ -70,7 +82,7 @@ for name in "${guard_vars[@]}"; do
 done
 contract="${guard_env[GUARD_CONTRACT_ID]:-}"
 [[ "$contract" == vault.?* ]] || die "GUARD_CONTRACT_ID must be vault.<owner> (got '${contract}'); set it in $envfile"
-echo "deployment: $contract (env file: $envfile)   scenario: $scenario"
+echo "deployment: $contract (env file: $envfile)   scenario: $scenario   wallet help: $wallet_help"
 
 # Rebuild the image whenever the wallet or Containerfile changed (labelled with their hash).
 src_hash="$(cat "$agent_dir/Containerfile" "$agent_dir/wallet" | sha256sum | cut -c1-16)"
@@ -84,11 +96,10 @@ fi
 mkdir -p "$runs"
 rundir="$(mktemp -d "$runs/$(date -u +%Y%m%dT%H%M%SZ)-XXXX")"
 sock_dir="$rundir/sock"
-sock="$sock_dir/guard.sock"
 mkdir -m 0700 "$sock_dir"
+sock="$("$py" "$agent_dir/guardrun.py" layer "$agent_dir/guard-agent.yaml" "$rundir" "$sock_dir" \
+  "$agent_dir/scenarios/$scenario" "$agent_dir/task.md" "$contract" "$agent_dir/wallet-help/$wallet_help.txt")"
 (( ${#sock} < 108 )) || die "socket path too long for a Unix socket (${#sock} bytes): $sock"
-"$py" "$agent_dir/guardrun.py" layer "$agent_dir/guard-agent.yaml" "$rundir" "$sock_dir" \
-  "$agent_dir/scenarios/$scenario" "$agent_dir/task.md" "$contract"
 
 # --- bridge: guard config only, no LLM key ------------------------------------------------
 (

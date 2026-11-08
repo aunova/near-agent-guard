@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
-"""wallet: the agent's only way to move money. It holds no key.
+"""wallet: pay from the company wallet. Holds no key.
 
-It sends ONE JSON request over a Unix socket to the host bridge (`guard serve`),
-prints the bridge's one-line JSON response, and exits with:
-  0 approved   2 denied (by the on-chain vault)   3 blocked (by the screen)   1 error
-Python 3 standard library only.
+Sends ONE JSON request over a Unix socket to the wallet service, prints the service's
+one-line JSON response, and exits 0 on success, 2 or 3 when the payment was not made,
+1 on error. Python 3 standard library only.
+
+Per-run configuration is a read-only directory ($WALLET_CONFIG_DIR, default /etc/wallet):
+  help.txt  the help text shown by `wallet help` and on usage errors
+  socket    the socket path, one line
 """
 
 import json
@@ -12,29 +15,27 @@ import os
 import socket
 import sys
 
-SOCKET_DEFAULT = "/run/guard/guard.sock"
-TIMEOUT_SECS = 90  # the bridge waits for a FINAL transaction before it answers
+CONFIG_DIR = os.environ.get("WALLET_CONFIG_DIR") or "/etc/wallet"
+TIMEOUT_SECS = 90  # the service waits for a FINAL transaction before it answers
 MAX_RESPONSE = 64 * 1024
 EXIT_BY_STATUS = {"approved": 0, "denied": 2, "blocked": 3}
-
-USAGE = """\
-usage:
-  wallet pay --to <account> --amount <NEAR decimal> [--memo <text>]
-  wallet call <method> [json]
-  wallet help
-
-  pay   ask the vault to send <amount> NEAR (e.g. 0.5) to <account>
-  call  forward a request to call another vault contract method
-  help  show this text
-
-The request goes to the payment guard at $GUARD_SOCKET (default {sock}).
-Output: the guard's JSON response, one line.
-Exit codes: 0 approved, 2 denied, 3 blocked, 1 error.
-""".format(sock=SOCKET_DEFAULT)
+FALLBACK_USAGE = "usage: wallet pay --to <account> --amount <NEAR> [--memo <text>] | wallet call <method> [json] | wallet help\n"
 
 
 class UsageError(Exception):
     pass
+
+
+def config(name):
+    try:
+        with open(os.path.join(CONFIG_DIR, name), encoding="utf-8") as f:
+            return f.read()
+    except OSError:
+        return None
+
+
+def usage():
+    return config("help.txt") or FALLBACK_USAGE
 
 
 def parse_pay(argv):
@@ -72,12 +73,14 @@ def parse_call(argv):
         raise UsageError("call needs <method> and at most one json argument")
     args = {"method": argv[0]}
     if len(argv) == 2:
-        args["json"] = argv[1]  # forwarded verbatim; the screen decides
+        args["json"] = argv[1]  # forwarded verbatim
     return {"tool": "call", "args": args}
 
 
 def send(request):
-    path = os.environ.get("GUARD_SOCKET") or SOCKET_DEFAULT
+    path = (config("socket") or os.environ.get("WALLET_SOCKET") or "").strip()
+    if not path:
+        raise OSError(f"no socket configured ({CONFIG_DIR}/socket or $WALLET_SOCKET)")
     line = json.dumps(request, separators=(",", ":")) + "\n"
     with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
         sock.settimeout(TIMEOUT_SECS)
@@ -102,7 +105,7 @@ def error(message):
 
 def main(argv):
     if not argv or argv[0] in ("help", "-h", "--help"):
-        print(USAGE, end="")
+        print(usage(), end="")
         return 0 if argv else 1
     try:
         if argv[0] == "pay":
@@ -113,14 +116,14 @@ def main(argv):
             raise UsageError(f"unknown command: {argv[0]}")
     except UsageError as e:
         print(f"wallet: {e}\n", file=sys.stderr)
-        print(USAGE, end="", file=sys.stderr)
+        print(usage(), end="", file=sys.stderr)
         return 1
     try:
         response = send(request)
     except (OSError, socket.timeout) as e:
-        return error(f"guard unreachable: {e.__class__.__name__}: {e}")
+        return error(f"wallet service unreachable: {e.__class__.__name__}: {e}")
     if not response:
-        return error("guard closed the connection without a response")
+        return error("wallet service closed the connection without a response")
     print(response)
     try:
         status = json.loads(response).get("status")

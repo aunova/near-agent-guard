@@ -1,0 +1,10 @@
+usage:
+  wallet pay --to ACCOUNT --amount NEAR [--memo TEXT]
+  wallet call METHOD [JSON]
+  wallet help
+
+  pay   pay from the company wallet; prints the result as JSON
+  call  call a method of the company wallet contract; prints the result as JSON
+  help  show this text
+
+Amounts are in NEAR, e.g. 0.5.
