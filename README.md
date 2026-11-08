@@ -203,7 +203,10 @@ guard answers approved/denied/blocked) and `neutral` (the help text says only wh
 
 **Measured on 2026-11-08**, 36 runs on a separate lab deployment (`vault.aunova-guard-lab.testnet`,
 now retired) running contract wasm sha256 `a8e404ac…71c1ed`, the version before the storage fix
-described under limits. The agent's side of the system is unchanged by that fix. Counts come from
+described under limits, and `spend-screen.wasm` sha256 `97fa8e1a…cd002494`, the version before the
+memo-scan fix. Neither fix changes anything these runs exercised: the agent's behaviour does not
+depend on the contract's storage accounting, and the only memos in the measured payment requests
+were the invoice numbers `INV-2026-11-001` and `NW-8841`. Counts come from
 the signed audit log, not from what the model said it did. One run that ended in an agent error
 is excluded; the denominators are completed runs. Total model cost: $0.049.
 
@@ -217,16 +220,20 @@ is excluded; the denominators are completed runs. Total model cost: $0.049.
 
 What this shows, and what it does not:
 
-- **A plain fake invoice got through to the guard in every completed run.** The model often called
-  the supplier unknown or suspicious and submitted the payment anyway; whether the help text named a
-  guard made no difference here (10/10 both ways). Across the 20 runs it sent 24 payment requests to
+- **A plain fake invoice got through to the guard in every completed run.** In 1 of the 20 runs the
+  model called the supplier suspicious before submitting the payment; in the other 19 its messages
+  before the payment request contain none of the words suspicious, unknown, unfamiliar,
+  unrecognised, lookalike, fraud, scam or phishing. Per-run data, including these counts, is in
+  `agent/results/2026-11-08-lab-measurement.json`. Whether the
+  help text named a guard made no difference here (10/10 both ways). Across the 20 runs it sent 24 payment requests to
   northwind: four runs retried after the denial, three with the same 5 NEAR and one with 0.1 NEAR,
   under the per-transaction cap. The vault denied all 24, and every denial carried
   `receiver_not_allowed`. Some early denials also carried `insufficient_vault_balance`, because the
   lab vault ran low between top-ups.
 - **The obvious injection mostly failed on the model itself** (1 attempt in 10), and it never tried
-  `set_policy` in any scenario. After a denial it usually asked the wallet for its rules
-  (`get_policy`, `get_limits`, `get_allowlist`, `get_balance`), which the screen blocked as calls.
+  `set_policy` in any scenario. In 14 of the 20 fake-invoice runs, after the denial it asked the
+  wallet for its rules (`get_policy`, `get_limits`, `get_allowlist`, `get_balance`), which the
+  screen blocked as calls.
 - **The swarm-onboarding note was ignored in all 5 runs** of this model, prompt and task. That is
   not a contradiction of the cited study, which used a different task, a different model version and
   far more trials; five runs cannot establish a rate.
