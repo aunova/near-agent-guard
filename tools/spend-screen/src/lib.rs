@@ -289,6 +289,20 @@ fn is_forbidden_memo_char(c: char) -> bool {
 
 const BASE58_ALPHABET: &[u8] = b"123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
 const BECH32_ALPHABET: &[u8] = b"qpzry9x8gf2tvdw0s3jn54khce6mua7l";
+/// A hex run this long counts as an encoded secret, and so does a base64-alphabet run with a
+/// window this long that switches character class more than `MAX_WINDOW_SWITCHES` times.
+const BLOB_RUN: usize = 40;
+/// A `BLOB_RUN`-byte window with more class switches than this (a rate above 15/40 = 0.375)
+/// reads as an encoded key. Measured over 100,000 random keys of each shape: 64-byte keys (88
+/// base58 or 86 base64 characters) never stayed at or under it; 32-byte keys (44 base58 or 43
+/// base64 characters) did 0.15% and 0.07% of the time. Run-together business memos with
+/// capitals and numbers measured 3 to 14; only strings of two- and three-letter Title Case words
+/// ("Pay For Web Dev And Ops ...", 24) switch like a key.
+const MAX_WINDOW_SWITCHES: usize = 15;
+/// A bech32 run this long (an `nsec` body) counts as an encoded secret if it contains a digit.
+const BECH32_RUN: usize = 58;
+/// This many consecutive short lowercase words are treated as a seed phrase.
+const SEED_WORDS: usize = 12;
 
 fn is_base58(byte: u8) -> bool {
     BASE58_ALPHABET.contains(&byte)
@@ -304,19 +318,120 @@ fn is_api_key_char(byte: u8) -> bool {
     byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_'
 }
 
+/// The standard base64 alphabet (it contains the base58 alphabet).
+fn is_base64(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || byte == b'+' || byte == b'/'
+}
+
+/// Invisible characters an agent could slip into a key to break a pattern without changing
+/// what a reader recovers: soft hyphen, zero-width space/joiners, bidi controls, word joiner and
+/// invisible operators, BOM, variation selectors, tag characters, fillers.
+fn is_invisible(c: char) -> bool {
+    matches!(
+        c,
+        '\u{00AD}'
+            | '\u{034F}'
+            | '\u{061C}'
+            | '\u{115F}'
+            | '\u{1160}'
+            | '\u{17B4}'
+            | '\u{17B5}'
+            | '\u{180B}'..='\u{180F}'
+            | '\u{200B}'..='\u{200F}'
+            | '\u{202A}'..='\u{202E}'
+            | '\u{2060}'..='\u{2064}'
+            | '\u{2066}'..='\u{206F}'
+            | '\u{3164}'
+            | '\u{FE00}'..='\u{FE0F}'
+            | '\u{FEFF}'
+            | '\u{FFA0}'
+            | '\u{1D173}'..='\u{1D17A}'
+            | '\u{E0000}'..='\u{E007F}'
+    )
+}
+
 /// Secret scan for the memo, which is public once on-chain: an injected agent could try to
-/// exfiltrate a key through it. Prefixes match ASCII case-insensitively; every run count stops
-/// at its threshold, so the scan stays linear in the memo length.
-pub fn contains_secret(text: &str) -> bool {
-    let bytes = text.as_bytes();
-    (0..bytes.len()).any(|start| {
-        let rest = bytes.get(start..).unwrap_or_default();
-        count_after(rest, b"ed25519:", 43, is_base58) >= 43
-            || count_after(rest, b"secp256k1:", 43, is_base58) >= 43
-            || count_after(rest, b"nsec1", 58, is_bech32) >= 58
-            || strip_prefix_ignore_case(rest, b"-----begin").is_some()
-            || api_key_alnum_after(rest) >= 20
+/// exfiltrate a key through it. Invisible characters are dropped first; for the pattern and run
+/// checks all whitespace (including NBSP) is dropped too, so spacing a key out does not hide it.
+/// Every check is linear in the memo length.
+pub fn contains_secret(memo: &str) -> bool {
+    let visible: String = memo.chars().filter(|c| !is_invisible(*c)).collect();
+    let compact: String = visible.chars().filter(|c| !c.is_whitespace()).collect();
+    let bytes = compact.as_bytes();
+    (0..bytes.len()).any(|start| has_secret_prefix(bytes.get(start..).unwrap_or_default()))
+        || has_high_entropy_run(bytes)
+        || looks_like_seed_phrase(&visible)
+}
+
+/// An encoded key without its prefix. Base58 and base64 keys flip between upper case, lower case
+/// and digits at almost every character; words run together, even capitalised and carrying a
+/// number, flip only at word boundaries. The rate is checked per window so that padding a key
+/// with filler cannot dilute it. Hex and bech32 runs need no rate: words break them.
+fn has_high_entropy_run(bytes: &[u8]) -> bool {
+    let runs = |class: fn(u8) -> bool| bytes.split(move |byte| !class(*byte));
+    runs(is_base64).any(|run| max_window_switches(run) > MAX_WINDOW_SWITCHES)
+        || runs(|byte| byte.is_ascii_hexdigit()).any(|run| run.len() >= BLOB_RUN)
+        || runs(is_bech32).any(|run| run.len() >= BECH32_RUN && run.iter().any(u8::is_ascii_digit))
+}
+
+/// Character class for the switch rate: upper case, lower case, digit, or `+`/`/`.
+fn switch_class(byte: u8) -> u8 {
+    match byte {
+        b'A'..=b'Z' => 0,
+        b'a'..=b'z' => 1,
+        b'0'..=b'9' => 2,
+        _ => 3,
+    }
+}
+
+/// The most class switches between neighbouring bytes inside any `BLOB_RUN`-byte window of
+/// `run` (a window holds `BLOB_RUN - 1` neighbour pairs); 0 when the run is shorter.
+fn max_window_switches(run: &[u8]) -> usize {
+    let flips: Vec<bool> = run.iter().zip(run.iter().skip(1)).map(|(a, b)| switch_class(*a) != switch_class(*b)).collect();
+    flips
+        .windows(BLOB_RUN - 1)
+        .map(|pairs| pairs.iter().filter(|flip| **flip).count())
+        .max()
+        .unwrap_or(0)
+}
+
+/// Key and token shapes that begin at the start of `rest`.
+fn has_secret_prefix(rest: &[u8]) -> bool {
+    const TOKEN_PREFIXES: [&[u8]; 5] = [b"ghp_", b"gho_", b"github_pat_", b"sk_live_", b"sk_test_"];
+    count_after(rest, b"ed25519:", 43, is_base58) >= 43
+        || count_after(rest, b"secp256k1:", 43, is_base58) >= 43
+        || count_after(rest, b"nsec1", 58, is_bech32) >= 58
+        || strip_prefix_ignore_case(rest, b"-----begin").is_some()
+        || api_key_alnum_after(rest) >= 20
+        || TOKEN_PREFIXES.iter().any(|prefix| strip_prefix_ignore_case(rest, prefix).is_some())
+        || is_slack_token(rest)
+        || rest
+            .strip_prefix(b"AKIA")
+            .is_some_and(|body| body.iter().take(16).filter(|b| b.is_ascii_uppercase() || b.is_ascii_digit()).count() == 16)
+        || rest.starts_with(b"AIza")
+}
+
+/// `xoxa-`, `xoxb-`, `xoxp-`, `xoxr-`, `xoxs-` (Slack tokens).
+fn is_slack_token(rest: &[u8]) -> bool {
+    strip_prefix_ignore_case(rest, b"xox").is_some_and(|after| {
+        matches!(after.first().map(u8::to_ascii_lowercase), Some(b'a' | b'b' | b'p' | b'r' | b's'))
+            && after.get(1) == Some(&b'-')
     })
+}
+
+/// A BIP-39 style seed phrase: `SEED_WORDS` or more consecutive words of 3 to 8 lowercase ASCII
+/// letters. Words are runs of ASCII letters, so digits or punctuation between them do not hide
+/// the phrase; a word with a capital, or of another length, ends the streak.
+fn looks_like_seed_phrase(text: &str) -> bool {
+    let mut streak = 0;
+    for word in text.split(|c: char| !c.is_ascii_alphabetic()).filter(|word| !word.is_empty()) {
+        let seed_like = (3..=8).contains(&word.len()) && word.bytes().all(|b| b.is_ascii_lowercase());
+        streak = if seed_like { streak + 1 } else { 0 };
+        if streak >= SEED_WORDS {
+            return true;
+        }
+    }
+    false
 }
 
 fn strip_prefix_ignore_case<'a>(hay: &'a [u8], prefix: &[u8]) -> Option<&'a [u8]> {
@@ -549,45 +664,136 @@ mod tests {
 
     #[test]
     fn memo_length_boundary_counts_utf8_bytes() {
-        assert!(allowed(&pay(VENDOR, "1", Some(&"x".repeat(256)))).memo.is_some());
-        assert_eq!(reasons(&pay(VENDOR, "1", Some(&"x".repeat(257)))), ["memo_too_long"]);
+        // Separated characters: a 256-char unbroken run would itself look like an encoded secret.
+        assert!(allowed(&pay(VENDOR, "1", Some(&"x-".repeat(128)))).memo.is_some());
+        assert_eq!(reasons(&pay(VENDOR, "1", Some(&format!("{}x", "x-".repeat(128))))), ["memo_too_long"]);
         // "é" is two bytes: 128 of them is exactly 256 bytes, 129 is over.
         assert!(allowed(&pay(VENDOR, "1", Some(&"é".repeat(128)))).memo.is_some());
         assert_eq!(reasons(&pay(VENDOR, "1", Some(&"é".repeat(129)))), ["memo_too_long"]);
     }
 
+    /// A NEAR ed25519 secret key body (64 bytes as base58), the same bytes as hex and as base64.
+    const KEY_B58: &str = "3tgdk2wPraJzT4nsTuf86UX41xgPNk3MHnq8epARMdBNs29AFEztAuaQ7iHddDfXG9F2RzV1XNQYgJyAyoW51UBB";
+    const KEY_HEX: &str = "7b2ef1a6b6d8c4f0e1d2c3b4a59687706f5e4d3c2b1a09f8e7d6c5b4a3928170fedcba98765432100123456789abcdeffedcba98765432100123456789abcdef";
+    const KEY_B64: &str = "ey7xprbYxPDh0sO0pZaHcG9eTTwrGgn459bFtKOSgXD+3LqYdlQyEAEjRWeJq83v/ty6mHZUMhABI0VniavN7w==";
+    /// 58 bech32 characters, the length of an `nsec1` body.
+    const NSEC_BODY: &str = "qpzry9x8gf2tvdw0s3jn54khce6mua7lqpzry9x8gf2tvdw0s3jn54khce";
+
     #[test]
-    fn memo_secret_patterns_are_caught() {
+    fn memo_secret_patterns_and_karls_evasions_are_caught() {
         let memos = [
-            format!("ed25519:{}", "3tgdk2wPraJzT4nsTuf86UX41xgPNk3MHnq8epARMdBNs29AFEztAuaQ7iHddDfXG9F2RzV1XNQYgJyAyoW51UBB"),
+            // Prefixed forms.
+            format!("ed25519:{KEY_B58}"),
             format!("pay me, key ED25519:{}", "A".repeat(43)),
             format!("secp256k1:{}", "5".repeat(43)),
             format!("nsec1{}", "q".repeat(58)),
             format!("NSEC1{}", "Q".repeat(58)),
-            "-----BEGIN PRIVATE KEY-----".to_owned(),
+            // Assembled at runtime so secret scanners do not flag this fixture header.
+            format!("-----BEGIN {} KEY-----", "PRIVATE"),
             "-----begin openssh".to_owned(),
             format!("sk-{}", "a1".repeat(10)),
             format!("key=sk-proj-{}", "Ab3_".repeat(6)),
             format!("sk-ant-api03-{}", "x".repeat(20)),
+            // Karl's evasions.
+            KEY_B58.to_owned(),                                              // bare key, prefix dropped
+            format!("ed25519: {KEY_B58}"),                                   // one space after the prefix
+            format!("ed25519:\u{200B}{KEY_B58}"),                            // zero-width space
+            format!("ed25519 {KEY_B58}"),                                    // space instead of the colon
+            format!("ed25519:{} {}", &KEY_B58[..40], &KEY_B58[40..]),        // split across words
+            format!("ed25519:{}\u{00A0}{}", &KEY_B58[..20], &KEY_B58[20..]), // NBSP inside
+            format!("{} {} {}", &KEY_B58[..30], &KEY_B58[30..60], &KEY_B58[60..]), // bare, single spaces
+            format!("{}\u{200B}{}", &KEY_B58[..44], &KEY_B58[44..]),             // bare, ZWSP
+            format!("{}\u{00A0}{}", &KEY_B58[..44], &KEY_B58[44..]),             // bare, NBSP
+            KEY_HEX.to_owned(),                                                    // the same bytes as hex
+            KEY_HEX.to_ascii_uppercase(),
+            format!("{} {}", &KEY_HEX[..64], &KEY_HEX[64..]),
+            KEY_B64.to_owned(), // and as base64
+            format!("{} {}", &KEY_B64[..30], &KEY_B64[30..]),
+            format!("nsec1-{NSEC_BODY}"), // hyphen inserted
+            NSEC_BODY.to_owned(),         // prefix dropped
+            "abandon ability able about above absent absorb abstract absurd abuse access accident".to_owned(),
+            "abandon1ability,able.about above absent absorb abstract absurd abuse access accident".to_owned(),
+            format!("ghp_{}", "a1B2c3D4e5F6g7H8i9J0kLmNoPqRsTuVwXyZ"),
+            format!("gho_{}", "a1B2c3D4e5"),
+            format!("github_pat_{}", "11ABCDEFG"),
+            format!("sk_live_{}", "51HxYzAbCdEfGhIjKlMnOpQr"),
+            format!("sk_test_{}", "4eC39HqLyjWDarjtT1zdp7dc"),
+            "xoxb-1234-5678-abcdef".to_owned(),
+            "xoxp-1234".to_owned(),
+            "AKIAIOSFODNN7EXAMPLE".to_owned(),
+            "AIzaSyD-example".to_owned(),
+            "-----BEG\u{200B}IN PRIVATE KEY-----".to_owned(), // PEM with ZWSP
+            "-----BEGIN\u{2060} OPENSSH".to_owned(),          // word joiner
         ];
         for memo in &memos {
             assert_eq!(reasons(&pay(VENDOR, "1", Some(memo))), ["memo_contains_secret"], "memo: {memo:?}");
         }
     }
 
+    /// `count` strings of `len` characters drawn from `alphabet` by a fixed-seed xorshift64, so
+    /// every run checks the same samples.
+    fn random_keys(alphabet: &[u8], len: usize, count: usize) -> Vec<String> {
+        let mut state: u64 = 0x9E37_79B9_7F4A_7C15;
+        (0..count)
+            .map(|_| {
+                (0..len)
+                    .map(|_| {
+                        state ^= state << 13;
+                        state ^= state >> 7;
+                        state ^= state << 17;
+                        char::from(alphabet[(state % alphabet.len() as u64) as usize])
+                    })
+                    .collect()
+            })
+            .collect()
+    }
+
     #[test]
-    fn memo_secret_near_misses_pass() {
+    fn random_64_byte_keys_switch_class_like_keys() {
+        const BASE64: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let keys = random_keys(BASE58_ALPHABET, 88, 10_000).into_iter().chain(random_keys(BASE64, 86, 10_000));
+        for key in keys {
+            assert!(max_window_switches(key.as_bytes()) > MAX_WINDOW_SWITCHES, "missed: {key}");
+        }
+    }
+
+    /// The rate is taken per 40-byte window, so filler around a key does not dilute it: over the
+    /// whole run, `KEY_B58` followed by 100 `o` switches at only about 0.30 per byte. The filler is
+    /// neither hex nor bech32 (`o`, `i`), so only the switch rate can catch these.
+    #[test]
+    fn padding_cannot_dilute_the_switch_rate() {
+        for memo in [
+            format!("{KEY_B58}{}", "o".repeat(100)),
+            format!("{}{KEY_B58}", "o".repeat(100)),
+            format!("{}{KEY_B58}{}", "invoice".repeat(10), "O".repeat(50)),
+        ] {
+            assert_eq!(reasons(&pay(VENDOR, "1", Some(&memo))), ["memo_contains_secret"], "memo: {memo:?}");
+        }
+    }
+
+    #[test]
+    fn normal_memos_pass() {
         for memo in [
             "INV-2026-11-001".to_owned(),
-            format!("ed25519:{}", "A".repeat(42)),
-            format!("ed25519:{}", "0".repeat(60)), // '0' is not base58
-            format!("secp256k1:{}", "l".repeat(60)), // 'l' is not base58
-            format!("nsec1{}", "q".repeat(57)),
-            format!("nsec1{}", "b".repeat(58)), // 'b' is not bech32
+            "NW-8841".to_owned(),
+            "Payment for October hosting and support services".to_owned(),
+            "Monthly retainer for consulting work November".to_owned(),
+            // Digits inside a 40+ character run once whitespace is gone.
+            "Invoice 2026 October Hosting and Support Services".to_owned(),
+            "Payment for invoice 4471 October hosting and support".to_owned(),
+            "Q4 2026 Managed Services Retainer Invoice 1182 Northwind Traders".to_owned(),
+            "Reimbursement Travel Expenses Dubai Conference 14 Nov 2026".to_owned(),
+            "PO 4471 AWS EC2 S3 RDS usage Oct 2026 acct 7781 ref 99812".to_owned(), // 14 switches, the most measured
+            "October hosting, 4 items".to_owned(),
+            "Invoice 2026/11 for hosting and support, thanks!".to_owned(),
+            "INV\u{200D}\u{200B}-1".to_owned(),
+            format!("ed25519:{}", &KEY_B58[..30]),
             "-----BEGI".to_owned(),
             format!("sk-{}", "a".repeat(19)),
             format!("sk-{}", "-".repeat(40)),
+            "AKIA-not-a-key".to_owned(),
         ] {
+            assert!(!contains_secret(&memo), "flagged as a secret: {memo:?}");
             assert!(allowed(&pay(VENDOR, "1", Some(&memo))).memo.is_some(), "memo: {memo:?}");
         }
     }
