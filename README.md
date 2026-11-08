@@ -101,24 +101,30 @@ they deploy, then test without rebuilding:
 
 ### 2. Read-only: check our testnet deployment against our published log (no keys)
 
-Our deployment: vault `vault.aunova-agent-guard.testnet`, agent `agent.aunova-agent-guard.testnet`,
-owner `aunova-agent-guard.testnet`. `demo/audit.jsonl` is the signed log of the official run. You
-need the bridge binary (`cd bridge && cargo build --release`) and two account names, no keys:
+Our deployment: vault `vault.aunova-agent-guard.testnet` (locked: no access keys), agent
+`agent.aunova-agent-guard.testnet`, owner `aunova-agent-guard.testnet`. Two signed logs are published:
+`demo/audit.jsonl` is the scripted official run (ledger 0 and 1, plus the blocked call and the
+raw-key attacks) and `demo/agent-take.jsonl` is one real DeepSeek agent run on the same vault
+(ledger 2 and 3). You need the bridge binary (`cd bridge && cargo build --release`) and two account
+names, no keys:
 
 ```sh
 export GUARD_CONTRACT_ID=vault.aunova-agent-guard.testnet AGENT_ACCOUNT_ID=agent.aunova-agent-guard.testnet
 bridge/target/release/guard ledger
-bridge/target/release/guard verify --complete --log demo/audit.jsonl
+bridge/target/release/guard verify --complete --log demo/audit.jsonl --log demo/agent-take.jsonl
 ```
 
-You should see the two on-chain entries and an `OK`:
+You should see four on-chain entries and an `OK`:
 
 ```text
-ledger_len 2
+ledger_len 4
 index  decision  receiver                               NEAR transfer       attempt        reasons
 0      approved  vendor.aunova-agent-guard.testnet          0.5 succeeded      12db7a14c61f
 1      denied    northwind.aunova-agent-guard.testnet            5 not_attempted  affd5937f05e   receiver_not_allowed,over_per_tx_max,over_window_limit
+2      approved  vendor.aunova-agent-guard.testnet          0.5 succeeded      038e879a32be
+3      denied    northwind.aunova-agent-guard.testnet            5 not_attempted  6820731e49af   receiver_not_allowed,over_per_tx_max,over_window_limit
 
+== demo/audit.jsonl
 line   attempt        origin     status             ledger  tx           screen
 1      12db7a14c61f…  replay     approved           0       Dcd4rp2ccNCr… allow 0.5 NEAR to vendor.aunova-agent-guard.testnet
 3      affd5937f05e…  replay     denied             1       3XrWz1QBp9Lr… allow 5 NEAR to northwind.aunova-agent-guard.testnet
@@ -127,17 +133,26 @@ line   attempt        origin     status             ledger  tx           screen
 9      0c2992607183…  attack     protocol_rejected  -       -            bypassed (attack with the raw key)
 11     693e511dc77d…  attack     protocol_rejected  -       -            bypassed (attack with the raw key)
 log      12 events, ids and BIP-340 signatures valid, prev chain intact, contract vault.aunova-agent-guard.testnet, agent agent.aunova-agent-guard.testnet
+== demo/agent-take.jsonl
+line   attempt        origin     status             ledger  tx           screen
+1      038e879a32be…  llm-agent  approved           2       7Ep4zoXgwC5y… allow 0.5 NEAR to vendor.aunova-agent-guard.testnet
+3      6820731e49af…  llm-agent  denied             3       7ZRMFcv8SoiQ… allow 5 NEAR to northwind.aunova-agent-guard.testnet
+5      b8448c9b179b…  llm-agent  blocked            -       -            reject tool_not_allowed:call
+7      36484a836c10…  llm-agent  blocked            -       -            reject tool_not_allowed:call
+9      a8910f705c19…  llm-agent  blocked            -       -            reject tool_not_allowed:call
+log      10 events, ids and BIP-340 signatures valid, prev chain intact, contract vault.aunova-agent-guard.testnet, agent agent.aunova-agent-guard.testnet
 signer   npub1u9w7vddpzpehc98a4madgfnm643agnr3u6lvxjplm7gmge8l480q2v2j7u
-chain    2 ledger entries read from https://test.rpc.fastnear.com
-ledger   2 logged results match their entries
-         indexes 0.. to the end of the ledger: all 2 entries for agent.aunova-agent-guard.testnet are covered by logged results (complete; anchor = the first ledger index a logged result carries)
+chain    4 ledger entries read from https://test.rpc.fastnear.com
+ledger   4 logged results match their entries
+         indexes 0.. to the end of the ledger: all 4 entries for agent.aunova-agent-guard.testnet are covered by logged results (complete; anchor = the first ledger index a logged result carries)
          0 entries for agent.aunova-agent-guard.testnet before index 0 (earlier runs): reported, not checked
 OK
 ```
 
-`--complete` also demands that every ledger entry for the agent from the log's start to the end
-of the ledger has its result in the log. If a later run used the vault, pass that run's log as a
-second `--log`; without `--complete`, `verify` checks only the range the log covers and prints
+`--complete` demands that every ledger entry for the agent from the logs' start to the end of the
+ledger has its result in one of the logs. Leave out `--log demo/agent-take.jsonl` and it fails with
+`FAIL ledger index 2: … no log has its result (truncated?)`, because the agent run's spends would
+be unaccounted for. Without `--complete`, `verify` checks only the range the logs cover and prints
 `tail not checked; use --complete`.
 
 Then try to break it:
@@ -151,10 +166,12 @@ Then try to break it:
   northwind.aunova-agent-guard.testnet, approved=false) and no log has its result (truncated?)` and exits 1.
 - Each line is a standard Nostr event, so `nak verify` (github.com/fiatjaf/nak) accepts every
   unedited line: `while read -r l; do printf '%s' "$l" | nak verify; done < demo/audit.jsonl`.
-- Look the two transactions up on a testnet explorer:
-  `Dcd4rp2ccNCrYrWeGBKVPQHBzuFyUXRfyTZGnxZrrJHn` (approved spend) and
-  `3XrWz1QBp9LrWp4h1BsPyPUma8QJavyw74moSyfdoizP` (denied spend, a successful transaction that
-  moved nothing).
+- Look the transactions up on a testnet explorer. Scripted run: `Dcd4rp2ccNCrYrWeGBKVPQHBzuFyUXRfyTZGnxZrrJHn`
+  (ledger 0, approved) and `3XrWz1QBp9LrWp4h1BsPyPUma8QJavyw74moSyfdoizP` (ledger 1, denied: a
+  successful transaction that moved nothing). DeepSeek agent run: `7Ep4zoXgwC5yEieNLcNzFy5pzLgSyEtMjNUhcB5WN62u`
+  (ledger 2, approved) and `7ZRMFcv8SoiQNNybp49UqGFd8JuvcikVt8HXidfT5aui` (ledger 3, denied).
+- Confirm the vault is locked: `near account list-keys vault.aunova-agent-guard.testnet network-config testnet now`
+  lists no keys.
 - Inspect the agent's keys: `near account list-keys agent.aunova-agent-guard.testnet network-config testnet now`
   shows one function-call key limited to `request_spend` on the vault, and the agent account's
   full-access key, which the owner holds and the bridge never sees.
