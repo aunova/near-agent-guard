@@ -1,0 +1,55 @@
+[package]
+name = "agent-guard"
+description = "NEAR vault that lets an AI agent spend within owner-set limits and records every attempt, approved or denied, in an on-chain ledger"
+version = "0.1.0"
+edition = "2024"
+# near-sdk 5.30 and near-workspaces 0.24 both declare rust-version 1.95.
+rust-version = "1.95"
+license = "MIT"
+# Read by near-sdk at build time for the NEP-330 `contract_source_metadata` view.
+repository = "https://github.com/aunova/near-agent-guard"
+publish = false
+
+[lib]
+# cdylib: the wasm contract. rlib: lets tests/ import the wire types.
+crate-type = ["cdylib", "rlib"]
+
+# Standalone crate: a bare workspace table so cargo never adopts a parent manifest.
+[workspace]
+
+[dependencies]
+# NEAR contract SDK: #[near] bindgen, store collections, env, Promise, U128, NEP-297 events.
+# Default features off: the only default, `wee_alloc`, installs an unmaintained allocator with
+# known leaks as the wasm global allocator (RUSTSEC-2022-0054); Rust's own allocator replaces it.
+near-sdk = { version = "5.30.1", default-features = false }
+
+[dev-dependencies]
+# testing_env! and the mocked blockchain for the unit tests in src/tests.rs.
+near-sdk = { version = "5.30.1", default-features = false, features = ["unit-testing"] }
+# Sandbox tests: runs a local neard, deploys target/near/agent_guard.wasm, signs with chosen keys.
+# Default features off: `rustls` only serves the testnet faucet helper (HTTPS), which the sandbox
+# never touches. `install` downloads the neard sandbox binary into OUT_DIR at build time.
+near-workspaces = { version = "0.24.0", default-features = false, features = ["install"] }
+# near-workspaces is async; #[tokio::test] drives it.
+tokio = { version = "1", features = ["macros", "rt"] }
+# Typed match on the RPC error the node returns when a function-call key oversteps
+# (JsonRpcError / RpcTransactionError). Already in the graph via near-workspaces 0.24.
+near-jsonrpc-client = "0.23.0"
+# InvalidTxError / InvalidAccessKeyError / TxExecutionError for those typed matches.
+# Already in the graph via near-workspaces 0.24.
+near-primitives = "0.38.0"
+
+[profile.release]
+codegen-units = 1
+# Optimize the contract for size.
+opt-level = "z"
+lto = true
+debug = false
+panic = "abort"
+# Arithmetic overflow aborts instead of wrapping silently.
+overflow-checks = true
+
+# near-sdk >= 5.27 macros emit `cfg(near)`; declare it so rustc does not warn about it.
+[lints.rust.unexpected_cfgs]
+level = "warn"
+check-cfg = ['cfg(near)']
