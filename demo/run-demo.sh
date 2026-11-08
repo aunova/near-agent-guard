@@ -43,8 +43,8 @@ step "4. compromised agent uses its key directly: plain transfer (NEAR must refu
 step "5. on-chain ledger"
 "$guard" ledger
 
-step "6. verify the signed log against the chain"
-"$guard" verify --log "$GUARD_AUDIT_LOG"
+step "6. verify the signed log against the chain (--complete: no on-chain spend since the run may be missing)"
+"$guard" verify --complete --log "$GUARD_AUDIT_LOG"
 
 step "7. tamper: raise the approved amount from 0.5 to 0.9 NEAR in one log line, verify again (must fail)"
 sed '0,/500000000000000000000000/s//900000000000000000000000/' "$GUARD_AUDIT_LOG" > "$run/audit.tampered.jsonl"
@@ -53,5 +53,15 @@ if "$guard" verify --log "$run/audit.tampered.jsonl"; then
   echo "UNEXPECTED: tampered log verified" >&2; exit 1
 fi
 echo "tampered log rejected, as it should be"
+
+step "8. truncate: keep only the first spend (lines 1-2), hiding the denied one; the hash chain stays valid"
+head -n 2 "$GUARD_AUDIT_LOG" > "$run/audit.truncated.jsonl"
+echo "-- plain verify cannot see a cut tail (it warns):"
+"$guard" verify --log "$run/audit.truncated.jsonl" | tail -n 3
+echo "-- verify --complete must fail:"
+if "$guard" verify --complete --log "$run/audit.truncated.jsonl"; then
+  echo "UNEXPECTED: truncated log verified with --complete" >&2; exit 1
+fi
+echo "truncated log rejected, as it should be"
 echo
 echo "run saved: $run"
