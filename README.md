@@ -63,8 +63,10 @@ Four levels, from no keys at all to the full LLM agent. Commands run from the re
 - `jq`, `curl`, `python3`, a C toolchain with `perl` and `make` (near-api builds a vendored
   OpenSSL), and OpenSSL headers with `pkg-config` (near-workspaces uses native-tls).
 - Build times on a laptop: the bridge's first release build takes about 5 to 6 minutes
-  (Wasmtime); the contract's first test run takes about 1.5 minutes and downloads a `neard`
-  sandbox binary into `contract/target/`.
+  (Wasmtime), and its first `cargo test` rebuilds dependencies with optimisation once (15 minutes
+  measured on a busy 8-core machine); the contract's first test run takes about 1.5 minutes and
+  downloads a `neard` sandbox binary into `contract/target/`. On a heavily loaded machine, run the
+  bridge tests with `-- --test-threads=1` if a screen test reports a timeout.
 
 ### 1. Offline: the tests (no keys, no testnet)
 
@@ -74,27 +76,37 @@ Four levels, from no keys at all to the full LLM agent. Commands run from the re
 (cd bridge && cargo test)   # needs the spend-screen.wasm from the line above
 ```
 
-Expected (measured on this machine): contract `53 passed` (unit) and `10 passed` (sandbox);
-spend-screen `20 passed`; bridge `38` unit + `5` CLI + `7` screen tests passed; clippy with
-`-D warnings` clean in all three crates. The contract's unit output also prints lines like
-`thread 'tests::duplicate_attempt_id_is_rejected' panicked at src/lib.rs:194:9`: those are
-`#[should_panic]` tests asserting a refusal, and they count as passed. With `--show-output`
-the sandbox tests print NEAR's own rejections of the agent's function-call key, for example:
+Expected (measured on this machine at the commit that deployed the vault): contract `62 passed`
+(unit) and `11 passed` (sandbox); spend-screen `22 passed`; bridge `47` unit + `6` CLI + `7` screen
+tests passed; clippy with `-D warnings` clean in all three crates. The contract's unit output also
+prints lines like `thread 'tests::duplicate_attempt_id_is_rejected' (…) panicked at src/lib.rs:…`:
+those are `#[should_panic]` tests asserting a refusal, and they count as passed. With
+`--show-output` the sandbox tests print NEAR's own rejections of the agent's function-call key and
+the storage bound, for example:
 
 ```text
-[scenario 3] set_policy via function-call key REJECTED by protocol: InvalidAccessKeyError(MethodNameMismatch { method_name: "set_policy" })
-[scenario 3] set_policy + 1 yoctoNEAR via function-call key REJECTED by protocol: InvalidAccessKeyError(DepositWithFunctionCall)
-[scenario 4] Transfer of 0.1 NEAR via function-call key REJECTED by protocol: InvalidAccessKeyError(RequiresFullAccess)
+[scenario 3] set_policy via function-call key REJECTED by protocol: InvalidAccessKeyError(MethodNameMismatch { method_name: "set_policy" }) (Transaction method name "set_policy" isn't allowed by the access key)
+[scenario 3] set_policy + 1 yoctoNEAR via function-call key REJECTED by protocol: InvalidAccessKeyError(DepositWithFunctionCall) (Having a deposit with a function call action is not allowed with a function call access key.)
+[scenario 4] Transfer of 0.1 NEAR via function-call key REJECTED by protocol: InvalidAccessKeyError(RequiresFullAccess) (Invalid access key type. Full-access keys are required for transactions that have multiple or non-function-call actions)
+[storage griefing] 10 denied entries recorded, then: Some("Smart contract panicked: window entry cap reached")
+[storage griefing] revoked agent's request_spend FAILED: Smart contract panicked: agent revoked
 ```
+
+`dist/agent_guard.wasm` and `dist/spend-screen.wasm` are the exact files deployed and pinned in
+the official run (`dist/SHA256SUMS`). The contract's on-chain code hash is the base58 form of the
+first sha256. Builds embed absolute paths, so rebuilding on another machine gives different bytes.
+To run the sandbox tests against the deployed bytes, copy the published file over the build output
+they deploy, then test without rebuilding:
+`cp dist/agent_guard.wasm contract/target/near/agent_guard.wasm && (cd contract && cargo test --test sandbox -- --show-output)`.
 
 ### 2. Read-only: check our testnet deployment against our published log (no keys)
 
-Our deployment: vault `vault.aunova-guard.testnet`, agent `agent.aunova-guard.testnet`, owner
-`aunova-guard.testnet`. `demo/audit.jsonl` is the signed log of the official run. You need the
-bridge binary (`cd bridge && cargo build --release`) and two account names, no keys:
+Our deployment: vault `vault.aunova-agent-guard.testnet`, agent `agent.aunova-agent-guard.testnet`,
+owner `aunova-agent-guard.testnet`. `demo/audit.jsonl` is the signed log of the official run. You
+need the bridge binary (`cd bridge && cargo build --release`) and two account names, no keys:
 
 ```sh
-export GUARD_CONTRACT_ID=vault.aunova-guard.testnet AGENT_ACCOUNT_ID=agent.aunova-guard.testnet
+export GUARD_CONTRACT_ID=vault.aunova-agent-guard.testnet AGENT_ACCOUNT_ID=agent.aunova-agent-guard.testnet
 bridge/target/release/guard ledger
 bridge/target/release/guard verify --complete --log demo/audit.jsonl
 ```
@@ -104,19 +116,22 @@ You should see the two on-chain entries and an `OK`:
 ```text
 ledger_len 2
 index  decision  receiver                               NEAR transfer       attempt        reasons
-0      approved  vendor.aunova-guard.testnet             0.5 succeeded      445cc2b7e604
-1      denied    northwind.aunova-guard.testnet            5 not_attempted  3513082de146   receiver_not_allowed,over_per_tx_max,over_window_limit
+0      approved  vendor.aunova-agent-guard.testnet          0.5 succeeded      12db7a14c61f
+1      denied    northwind.aunova-agent-guard.testnet            5 not_attempted  affd5937f05e   receiver_not_allowed,over_per_tx_max,over_window_limit
 
-line   attempt        origin     status             ledger  tx            screen
-1      445cc2b7e604…  replay     approved           0       BcAsczCrm4dW… allow 0.5 NEAR to vendor.aunova-guard.testnet
-3      3513082de146…  replay     denied             1       BjUg36Q2KdoX… allow 5 NEAR to northwind.aunova-guard.testnet
-5      a9db025af5c2…  replay     blocked            -       -             reject tool_not_allowed:call
-7      169e9a4916e5…  attack     protocol_rejected  -       -             bypassed (attack with the raw key)
-9      b1f059359f57…  attack     protocol_rejected  -       -             bypassed (attack with the raw key)
-11     2db3d9e4347b…  attack     protocol_rejected  -       -             bypassed (attack with the raw key)
-log      12 events, ids and BIP-340 signatures valid, prev chain intact, ...
+line   attempt        origin     status             ledger  tx           screen
+1      12db7a14c61f…  replay     approved           0       Dcd4rp2ccNCr… allow 0.5 NEAR to vendor.aunova-agent-guard.testnet
+3      affd5937f05e…  replay     denied             1       3XrWz1QBp9Lr… allow 5 NEAR to northwind.aunova-agent-guard.testnet
+5      f20d54324a3c…  replay     blocked            -       -            reject tool_not_allowed:call
+7      e115dd96b1c7…  attack     protocol_rejected  -       -            bypassed (attack with the raw key)
+9      0c2992607183…  attack     protocol_rejected  -       -            bypassed (attack with the raw key)
+11     693e511dc77d…  attack     protocol_rejected  -       -            bypassed (attack with the raw key)
+log      12 events, ids and BIP-340 signatures valid, prev chain intact, contract vault.aunova-agent-guard.testnet, agent agent.aunova-agent-guard.testnet
+signer   npub1u9w7vddpzpehc98a4madgfnm643agnr3u6lvxjplm7gmge8l480q2v2j7u
+chain    2 ledger entries read from https://test.rpc.fastnear.com
 ledger   2 logged results match their entries
-         indexes 0.. to the end of the ledger: all 2 entries for agent.aunova-guard.testnet are covered by logged results (complete; ...)
+         indexes 0.. to the end of the ledger: all 2 entries for agent.aunova-agent-guard.testnet are covered by logged results (complete; anchor = the first ledger index a logged result carries)
+         0 entries for agent.aunova-agent-guard.testnet before index 0 (earlier runs): reported, not checked
 OK
 ```
 
@@ -133,14 +148,14 @@ Then try to break it:
 - Cut the log's tail so the hash chain stays valid but the denied spend disappears:
   `head -n 2 demo/audit.jsonl > cut.jsonl`. Plain `verify --log cut.jsonl` still prints `OK` (with
   `tail not checked`); `verify --complete --log cut.jsonl` prints `FAIL ledger index 1: ... 5 NEAR to
-  northwind.aunova-guard.testnet, approved=false) and no log has its result (truncated?)` and exits 1.
+  northwind.aunova-agent-guard.testnet, approved=false) and no log has its result (truncated?)` and exits 1.
 - Each line is a standard Nostr event, so `nak verify` (github.com/fiatjaf/nak) accepts every
   unedited line: `while read -r l; do printf '%s' "$l" | nak verify; done < demo/audit.jsonl`.
 - Look the two transactions up on a testnet explorer:
-  `BcAsczCrm4dWXfQiYrDRKCL69g6yg9u1QissYPSRUEsy` (approved spend) and
-  `BjUg36Q2KdoXxLXBRsJVms9mFkmz3qF1guMe4uZh2SEs` (denied spend, a successful transaction that
+  `Dcd4rp2ccNCrYrWeGBKVPQHBzuFyUXRfyTZGnxZrrJHn` (approved spend) and
+  `3XrWz1QBp9LrWp4h1BsPyPUma8QJavyw74moSyfdoizP` (denied spend, a successful transaction that
   moved nothing).
-- Inspect the agent's keys: `near account list-keys agent.aunova-guard.testnet network-config testnet now`
+- Inspect the agent's keys: `near account list-keys agent.aunova-agent-guard.testnet network-config testnet now`
   shows one function-call key limited to `request_spend` on the vault, and the agent account's
   full-access key, which the owner holds and the bridge never sees.
 - The static viewer in `web/` renders the same ledger from public RPC:
@@ -156,18 +171,21 @@ demo/run-demo.sh                                 # the three requests, two raw-k
 
 `run-demo.sh` prints the policy, sends the agent's three requests through the WasmBox screen,
 the signed log and the contract, runs the two raw-key attacks, prints the ledger, verifies the
-log against the chain, then edits one digit and shows `verify` rejecting it. The official run
-(the one in `demo/audit.jsonl`) printed, in part:
+log against the chain with `--complete`, then edits one digit and cuts the log's tail and shows
+`verify` rejecting both. The official run (the one in `demo/audit.jsonl`) printed, in part
+(each attack prints a second line naming the logged attempt):
 
 ```text
-{"status":"approved","attempt_id":"445cc2b7…","ledger_index":0,"tx":"BcAsczCrm4dW…","transfer":"succeeded"}
-{"status":"denied","attempt_id":"3513082d…","ledger_index":1,"tx":"BjUg36Q2KdoX…","reasons":["receiver_not_allowed","over_per_tx_max","over_window_limit"]}
-{"status":"blocked","attempt_id":"a9db025a…","reasons":["tool_not_allowed:call"]}
-attack escalate:        protocol_rejected: method_name_mismatch {"method_name":"set_policy"}
-attack escalate-1yocto: protocol_rejected: deposit_with_function_call
-attack transfer:        protocol_rejected: requires_full_access
+{"status":"approved","attempt_id":"12db7a14…","ledger_index":0,"tx":"Dcd4rp2ccNCr…","transfer":"succeeded"}
+{"status":"denied","attempt_id":"affd5937…","ledger_index":1,"tx":"3XrWz1QBp9Lr…","reasons":["receiver_not_allowed","over_per_tx_max","over_window_limit"]}
+{"status":"blocked","attempt_id":"f20d5432…","reasons":["tool_not_allowed:call"]}
+  protocol_rejected: method_name_mismatch {"method_name":"set_policy"}
+  protocol_rejected: deposit_with_function_call
+  protocol_rejected: requires_full_access
 FAIL line 1: event id does not match its content (edited after signing)
 tampered log rejected, as it should be
+FAIL ledger index 1: agent.aunova-agent-guard.testnet spent under attempt affd5937… (5 NEAR to northwind.aunova-agent-guard.testnet, approved=false) and no log has its result (truncated?)
+truncated log rejected, as it should be
 ```
 
 The setup script writes a second deployment to another file if you pass `GUARD_ENV_FILE`
@@ -262,7 +280,7 @@ allowance. The agent account's full-access key stays with the owner, outside the
   owner can add a fresh key. (An account holding only function-call keys could never do that.)
 - Money leaves the **vault** account, never the agent account. Our deployment's vault is
   **locked**: after the final deploy all of its access keys were deleted, so
-  `near account list-keys vault.aunova-guard.testnet network-config testnet now` lists none,
+  `near account list-keys vault.aunova-agent-guard.testnet network-config testnet now` lists none,
   and nobody can transfer from it or redeploy it. Funds leave only through contract code:
   an agent's `request_spend` after the checks, or the owner's `withdraw` (1 yoctoNEAR, so a
   full-access key on the owner account).
@@ -290,8 +308,26 @@ Stated plainly so nobody has to infer them:
   An agent that spends the full window limit just before a window ends can spend it again just
   after, so up to twice the limit can leave across one boundary. The per-transaction cap and
   the receiver allowlist still apply to every spend.
-- **Memos are public.** They are stored on-chain. The screen rejects memos that look like keys
-  or secrets, which stops the obvious exfiltration, not every encoding of it.
+- **Memos are public, and the memo scan is a speed bump, not a wall.** Memos are stored on-chain,
+  so an injected agent could try to leak a secret through one. The real protection is that the
+  agent has no secret to leak (the container holds no key and no forwarded environment). The
+  screen also rejects a memo (`memo_contains_secret`) when, after invisible characters are
+  dropped and, for the first two groups, all whitespace too, it contains:
+  1. a prefixed key or token: `ed25519:` or `secp256k1:` plus 43+ base58 characters, `nsec1` plus
+     58+ bech32 characters, `-----BEGIN`, `sk-` plus a 20+ character token, `ghp_`, `gho_`,
+     `github_pat_`, `sk_live_`, `sk_test_`, `xoxa-`/`xoxb-`/`xoxp-`/`xoxr-`/`xoxs-`, `AKIA` plus 16
+     uppercase/digits, or `AIza`;
+  2. an encoded key without a prefix: a run of `[A-Za-z0-9+/]` in which some 40-character window
+     switches between upper case, lower case, digits and `+/` more than 15 times (random base58 and
+     base64 do; English with numbers does not), 40+ hex digits, or 58+ bech32 characters with a digit;
+  3. a seed phrase: 12 or more consecutive words of 3 to 8 lowercase letters.
+
+  Measured on 100,000 random keys per shape, 64-byte keys (the size of a NEAR secret key) were caught
+  every time in base58 and base64; 32-byte keys slipped through 0.15% (base58) and 0.07% (base64) of
+  the time. Known gaps: a key split into pieces by `-`, `_`, `.`, `,`, `=` or `:` (kept so memos like
+  `INV-2026-11-001` pass), single-case encodings such as base32, and anything spelled out in words.
+  Known false positives: runs of two-letter Title Case words such as "Pay For Web Dev And Ops Team",
+  and twelve or more short lowercase words in a row.
 - **Denials cost the agent gas and the vault storage, both bounded.** A denied spend is a
   successful transaction (that is how the denial gets on-chain), paid from the agent key's gas
   allowance, and its ledger entry is stored at the vault's expense. Each agent may record at most
