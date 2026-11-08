@@ -1,11 +1,15 @@
 //! `agent-guard`: a NEAR vault an AI agent can spend from without ever holding a key that can do
 //! anything else.
 //!
-//! The owner (full-access key) gives each agent a [`Policy`]: a per-transaction cap, a rolling
-//! window cap, a receiver allowlist and a revocation switch. The agent calls `request_spend` with a
-//! function-call key that may call nothing else. Every attempt from a known agent, approved or
-//! denied, is appended to an on-chain ledger with the id of the bridge's signed audit event, so the
-//! off-chain audit log and the chain cross-check.
+//! The owner (full-access key) gives each agent a [`Policy`]: a per-transaction cap, a cap per
+//! time window, a receiver allowlist, a cap on ledger entries per window and a revocation switch.
+//! The window is fixed, not sliding: the first starts when the policy is created and each later
+//! one at the first request after the previous one ended, so up to twice the window cap can leave
+//! across a window boundary. The agent calls `request_spend` with a function-call key that may
+//! call nothing else. Every attempt from a known, unrevoked agent, approved or denied, is appended
+//! to an on-chain ledger with the id of the bridge's signed audit event, so the off-chain audit
+//! log and the chain cross-check. The entry cap bounds the storage one agent can make the vault
+//! pay for: per window, at most `max_entries_per_window` x `max_entry_storage_bytes()` bytes.
 
 #![forbid(unsafe_code)]
 
@@ -40,6 +44,13 @@ const MAX_LEDGER_PAGE: usize = 100;
 const VAULT_RESERVE: NearToken = NearToken::from_millinear(100);
 /// Gas reserved for the `on_transfer` callback; it also inherits the call's unused gas.
 const ON_TRANSFER_GAS: Gas = Gas::from_tgas(10);
+/// Highest `max_entries_per_window` a policy may set.
+const MAX_ENTRIES_PER_WINDOW: u32 = 1_000;
+/// Most storage one recorded entry adds, in bytes. A ledger record (5-byte key; 515-byte value for
+/// a 64-character agent and receiver, a 256-byte memo and the 4 reasons a recorded entry can carry
+/// at most) plus an attempt-id record (69-byte key, empty value), each with the 40 bytes NEAR
+/// charges per record. `tests::max_entry_storage_bytes_is_the_measured_worst_case` measures it.
+const MAX_ENTRY_STORAGE_BYTES: u64 = 669;
 
 #[near(serializers = [borsh])]
 #[derive(BorshStorageKey)]
@@ -75,7 +86,7 @@ impl AgentGuard {
     }
 
     /// Creates `agent`'s policy with a fresh window, or replaces the limits and allowlist of an
-    /// existing one while keeping its window. Always clears `revoked`.
+    /// existing one while keeping its window (start, spent, entries). Always clears `revoked`.
     ///
     /// Owner only, with exactly 1 yoctoNEAR attached: a function-call key cannot attach a deposit,
     /// so only a full-access key can sign this.
@@ -86,11 +97,16 @@ impl AgentGuard {
         per_tx_max: U128,
         window_limit: U128,
         window_secs: u64,
+        max_entries_per_window: u32,
         allowed_receivers: Vec<AccountId>,
     ) {
         self.assert_owner();
         assert_one_yocto();
         require!(window_secs > 0, "window_secs must be greater than 0");
+        require!(
+            (1..=MAX_ENTRIES_PER_WINDOW).contains(&max_entries_per_window),
+            format!("max_entries_per_window must be between 1 and {MAX_ENTRIES_PER_WINDOW}")
+        );
         require!(
             allowed_receivers.len() <= MAX_RECEIVERS,
             format!("at most {MAX_RECEIVERS} allowed_receivers")
@@ -103,6 +119,7 @@ impl AgentGuard {
                 policy.per_tx_max = per_tx_max;
                 policy.window_limit = window_limit;
                 policy.window_secs = window_secs;
+                policy.max_entries_per_window = max_entries_per_window;
                 policy.allowed_receivers = allowed_receivers;
                 policy.revoked = false;
                 policy
@@ -111,10 +128,12 @@ impl AgentGuard {
                 per_tx_max,
                 window_limit,
                 window_secs,
+                max_entries_per_window,
                 allowed_receivers,
                 revoked: false,
                 window_start_ms: now_ms,
                 window_spent: U128(0),
+                window_entries: 0,
             }),
         };
         GuardEvent::PolicySet(&[PolicySetData {
@@ -122,13 +141,15 @@ impl AgentGuard {
             per_tx_max,
             window_limit,
             window_secs,
+            max_entries_per_window,
             allowed_receivers: &policy.allowed_receivers,
         }])
         .emit();
     }
 
-    /// Revokes `agent`: every later `request_spend` from it is denied with `revoked` until
-    /// `set_policy` is called again. Owner only, with exactly 1 yoctoNEAR attached.
+    /// Revokes `agent`: every later `request_spend` from it panics and stores nothing, exactly
+    /// like an unknown agent, until `set_policy` is called again. `check_spend` reports `revoked`.
+    /// Owner only, with exactly 1 yoctoNEAR attached.
     #[payable]
     pub fn revoke(&mut self, agent: AccountId) {
         self.assert_owner();
@@ -160,12 +181,14 @@ impl AgentGuard {
 
     /// The calling agent asks the vault to send `amount` yoctoNEAR to `receiver`.
     ///
-    /// Panics, leaving no state and no ledger entry, for an unknown agent (so strangers cannot
-    /// make the vault pay storage for spam), an `attempt_id` that is not 64 lowercase hex
-    /// characters, a memo over 256 bytes, or an `attempt_id` already recorded (a bridge retry can
-    /// never spend twice). Otherwise records the decision and returns normally whether it approves
-    /// or denies: a denial is a successful transaction, so it is on-chain. An approval sends the
-    /// transfer, and `on_transfer` settles the entry when it lands.
+    /// Panics, leaving no state and no ledger entry, for an unknown or revoked agent (so they
+    /// cannot make the vault pay storage for spam), an `attempt_id` that is not 64 lowercase hex
+    /// characters, a memo over 256 bytes, a window that already holds `max_entries_per_window`
+    /// entries (checked after the window rolls), or an `attempt_id` already recorded (a bridge
+    /// retry can never spend twice). Otherwise records the decision, counting it against the
+    /// window's entries, and returns normally whether it approves or denies: a denial is a
+    /// successful transaction, so it is on-chain. An approval sends the transfer, and
+    /// `on_transfer` settles the entry when it lands.
     pub fn request_spend(
         &mut self,
         receiver: AccountId,
@@ -179,6 +202,7 @@ impl AgentGuard {
         let Some(policy) = self.policies.get_mut(&agent) else {
             env::panic_str(&format!("unknown agent {agent}"))
         };
+        require!(!policy.revoked, "agent revoked");
         require!(
             is_attempt_id(&attempt_id),
             "attempt_id must be exactly 64 lowercase hex characters"
@@ -187,6 +211,12 @@ impl AgentGuard {
             memo.as_ref()
                 .is_none_or(|memo| memo.len() <= MAX_MEMO_BYTES),
             format!("memo exceeds {MAX_MEMO_BYTES} bytes")
+        );
+        rules::roll_window(policy, now_ms);
+        // Refuses at any count >= the cap, not only ==: the owner may lower the cap mid-window.
+        require!(
+            policy.window_entries < policy.max_entries_per_window,
+            "window entry cap reached"
         );
         // Records the id; false means it was already recorded. A panic anywhere in this call
         // rolls the write back.
@@ -199,6 +229,8 @@ impl AgentGuard {
             // Approval means window_spent + amount <= window_limit, so this cannot saturate.
             policy.window_spent = U128(policy.window_spent.0.saturating_add(amount.0));
         }
+        // Below max_entries_per_window <= 1000 (checked above), so this cannot overflow.
+        policy.window_entries += 1;
 
         let index = u64::from(self.ledger.len());
         let entry = LedgerEntry {
@@ -346,6 +378,13 @@ impl AgentGuard {
     /// figure decides `insufficient_vault_balance` and caps `withdraw`.
     pub fn vault_available(&self) -> U128 {
         U128(available_yocto())
+    }
+
+    /// Most storage, in bytes, one recorded ledger entry can add (64-character agent and receiver,
+    /// 256-byte memo). One agent can therefore lock at most `max_entries_per_window` x this x
+    /// 10^19 yoctoNEAR (the storage byte cost) of the vault's balance as storage stake per window.
+    pub fn max_entry_storage_bytes() -> u64 {
+        MAX_ENTRY_STORAGE_BYTES
     }
 }
 

@@ -1,19 +1,23 @@
 //! The spend rule. `decide` is the only code that judges a spend: `request_spend` runs it on the
-//! stored policy, the `check_spend` view runs it on a copy, so the two can never disagree.
+//! stored policy, the `check_spend` view runs it on a copy, so the two can never disagree about a
+//! spend. Before judging, `request_spend` also refuses (panics, stores nothing) what it would not
+//! record at all: an unknown or revoked agent, malformed input, a full window, a repeated id.
 
 use near_sdk::AccountId;
 use near_sdk::json_types::U128;
 
 use crate::types::{DenyReason, Policy};
 
-/// Starts a fresh window (start = now, spent = 0) once `now_ms` reaches the end of the current one.
-fn roll_window(policy: &mut Policy, now_ms: u64) {
+/// Starts a fresh window (start = now, spent = 0, entries = 0) once `now_ms` reaches the end of the
+/// current one. A second call at the same `now_ms` changes nothing.
+pub(crate) fn roll_window(policy: &mut Policy, now_ms: u64) {
     let window_end_ms = policy
         .window_start_ms
         .saturating_add(policy.window_secs.saturating_mul(1_000));
     if now_ms >= window_end_ms {
         policy.window_start_ms = now_ms;
         policy.window_spent = U128(0);
+        policy.window_entries = 0;
     }
 }
 

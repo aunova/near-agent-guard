@@ -14,6 +14,7 @@ pub(crate) struct PolicySetData<'a> {
     pub per_tx_max: U128,
     pub window_limit: U128,
     pub window_secs: u64,
+    pub max_entries_per_window: u32,
     pub allowed_receivers: &'a [AccountId],
 }
 

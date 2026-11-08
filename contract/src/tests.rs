@@ -8,7 +8,7 @@ use near_sdk::json_types::U128;
 use near_sdk::mock::MockAction;
 use near_sdk::serde_json;
 use near_sdk::test_utils::{VMContextBuilder, get_created_receipts, get_logs};
-use near_sdk::{AccountId, NearToken, PromiseError, testing_env};
+use near_sdk::{AccountId, NearToken, PromiseError, env, testing_env};
 
 use crate::rules::decide;
 use crate::types::DenyReason::{
@@ -16,7 +16,7 @@ use crate::types::DenyReason::{
     UnknownAgent, ZeroAmount,
 };
 use crate::types::{Decision, DenyReason, LedgerEntry, Policy, SpendReceipt, TransferStatus};
-use crate::{AgentGuard, ON_TRANSFER_GAS};
+use crate::{AgentGuard, MAX_ENTRY_STORAGE_BYTES, ON_TRANSFER_GAS};
 
 const ONE_NEAR: u128 = 10u128.pow(24);
 const HALF_NEAR: u128 = ONE_NEAR / 2;
@@ -27,6 +27,8 @@ const BLOCK_HEIGHT: u64 = 4_242;
 /// Default mocked vault: 100 NEAR held, 100 kB stored (1 NEAR stake), so 98.9 NEAR available.
 const BALANCE: u128 = 100 * ONE_NEAR;
 const STORAGE_BYTES: u64 = 100_000;
+/// `setup`'s `max_entries_per_window`: room for the 105-entry pagination test in one window.
+const CAP: u32 = 200;
 const APPROVED: [DenyReason; 0] = [];
 
 fn account(id: &str) -> AccountId {
@@ -79,17 +81,19 @@ fn call_as(caller: &AccountId, deposit: u128, now_ms: u64) {
     env_full(caller, deposit, now_ms, BALANCE, STORAGE_BYTES);
 }
 
-/// The policy `setup` gives the agent: 0.5 NEAR per transaction, 1 NEAR per day, to the vendor
-/// only, window starting at T0.
+/// The policy `setup` gives the agent: 0.5 NEAR per transaction, 1 NEAR and `CAP` entries per day,
+/// to the vendor only, window starting at T0.
 fn policy(per_tx_max: u128, window_limit: u128) -> Policy {
     Policy {
         per_tx_max: U128(per_tx_max),
         window_limit: U128(window_limit),
         window_secs: DAY_SECS,
+        max_entries_per_window: CAP,
         allowed_receivers: vec![vendor()],
         revoked: false,
         window_start_ms: T0_MS,
         window_spent: U128(0),
+        window_entries: 0,
     }
 }
 
@@ -103,6 +107,7 @@ fn setup() -> AgentGuard {
         U128(HALF_NEAR),
         U128(ONE_NEAR),
         DAY_SECS,
+        CAP,
         vec![vendor()],
     );
     guard
@@ -134,6 +139,14 @@ fn window(guard: &AgentGuard) -> (u64, u128) {
     (policy.window_start_ms, policy.window_spent.0)
 }
 
+/// The agent's stored window_entries.
+fn entries(guard: &AgentGuard) -> u32 {
+    guard
+        .get_policy(agent())
+        .expect("agent policy")
+        .window_entries
+}
+
 /// The NEP-297 log line for event `name` carrying one `data` object.
 fn event(name: &str, data: &str) -> String {
     format!(
@@ -147,9 +160,10 @@ fn event(name: &str, data: &str) -> String {
 fn policy_json_is_the_spec_shape() {
     let mut policy = policy(HALF_NEAR, ONE_NEAR);
     policy.window_start_ms = 1_762_600_000_000;
+    policy.window_entries = 3;
     assert_eq!(
         serde_json::to_string(&policy).unwrap(),
-        r#"{"per_tx_max":"500000000000000000000000","window_limit":"1000000000000000000000000","window_secs":86400,"allowed_receivers":["vendor.aunova-guard.testnet"],"revoked":false,"window_start_ms":1762600000000,"window_spent":"0"}"#
+        r#"{"per_tx_max":"500000000000000000000000","window_limit":"1000000000000000000000000","window_secs":86400,"max_entries_per_window":200,"allowed_receivers":["vendor.aunova-guard.testnet"],"revoked":false,"window_start_ms":1762600000000,"window_spent":"0","window_entries":3}"#
     );
 }
 
@@ -355,6 +369,7 @@ fn set_policy_creates_a_fresh_window_and_emits_policy_set() {
         U128(HALF_NEAR),
         U128(ONE_NEAR),
         DAY_SECS,
+        CAP,
         vec![vendor()],
     );
 
@@ -365,7 +380,7 @@ fn set_policy_creates_a_fresh_window_and_emits_policy_set() {
         get_logs(),
         [event(
             "policy_set",
-            r#"{"agent":"agent.aunova-guard.testnet","per_tx_max":"500000000000000000000000","window_limit":"1000000000000000000000000","window_secs":86400,"allowed_receivers":["vendor.aunova-guard.testnet"]}"#
+            r#"{"agent":"agent.aunova-guard.testnet","per_tx_max":"500000000000000000000000","window_limit":"1000000000000000000000000","window_secs":86400,"max_entries_per_window":200,"allowed_receivers":["vendor.aunova-guard.testnet"]}"#
         )]
     );
 }
@@ -381,6 +396,7 @@ fn set_policy_on_an_existing_agent_keeps_the_window_and_clears_revoked() {
         U128(ONE_NEAR),
         U128(2 * ONE_NEAR),
         3_600,
+        7,
         vec![vendor(), drain()],
     );
     assert_eq!(
@@ -389,10 +405,12 @@ fn set_policy_on_an_existing_agent_keeps_the_window_and_clears_revoked() {
             per_tx_max: U128(ONE_NEAR),
             window_limit: U128(2 * ONE_NEAR),
             window_secs: 3_600,
+            max_entries_per_window: 7,
             allowed_receivers: vec![vendor(), drain()],
             revoked: false,
             window_start_ms: T0_MS,
             window_spent: U128(HALF_NEAR),
+            window_entries: 1,
         })
     );
 }
@@ -407,6 +425,7 @@ fn set_policy_rejects_a_non_owner() {
         U128(ONE_NEAR),
         U128(ONE_NEAR),
         DAY_SECS,
+        CAP,
         vec![drain()],
     );
 }
@@ -421,6 +440,7 @@ fn set_policy_rejects_a_missing_yocto() {
         U128(ONE_NEAR),
         U128(ONE_NEAR),
         DAY_SECS,
+        CAP,
         vec![vendor()],
     );
 }
@@ -435,6 +455,7 @@ fn set_policy_rejects_two_yocto() {
         U128(ONE_NEAR),
         U128(ONE_NEAR),
         DAY_SECS,
+        CAP,
         vec![vendor()],
     );
 }
@@ -444,7 +465,51 @@ fn set_policy_rejects_two_yocto() {
 fn set_policy_rejects_a_zero_window() {
     let mut guard = setup();
     call_as(&owner(), 1, T0_MS);
-    guard.set_policy(agent(), U128(ONE_NEAR), U128(ONE_NEAR), 0, vec![vendor()]);
+    guard.set_policy(
+        agent(),
+        U128(ONE_NEAR),
+        U128(ONE_NEAR),
+        0,
+        CAP,
+        vec![vendor()],
+    );
+}
+
+fn set_entry_cap(max_entries_per_window: u32) -> AgentGuard {
+    let mut guard = setup();
+    call_as(&owner(), 1, T0_MS);
+    guard.set_policy(
+        agent(),
+        U128(HALF_NEAR),
+        U128(ONE_NEAR),
+        DAY_SECS,
+        max_entries_per_window,
+        vec![vendor()],
+    );
+    guard
+}
+
+#[test]
+fn set_policy_accepts_entry_caps_from_1_to_1000() {
+    for cap in [1, 1_000] {
+        let guard = set_entry_cap(cap);
+        assert_eq!(
+            guard.get_policy(agent()).unwrap().max_entries_per_window,
+            cap
+        );
+    }
+}
+
+#[test]
+#[should_panic(expected = "max_entries_per_window must be between 1 and 1000")]
+fn set_policy_rejects_a_zero_entry_cap() {
+    set_entry_cap(0);
+}
+
+#[test]
+#[should_panic(expected = "max_entries_per_window must be between 1 and 1000")]
+fn set_policy_rejects_an_entry_cap_over_1000() {
+    set_entry_cap(1_001);
 }
 
 fn receivers(count: usize) -> Vec<AccountId> {
@@ -462,6 +527,7 @@ fn set_policy_accepts_32_receivers() {
         U128(ONE_NEAR),
         U128(ONE_NEAR),
         DAY_SECS,
+        CAP,
         receivers(32),
     );
     assert_eq!(
@@ -480,12 +546,13 @@ fn set_policy_rejects_33_receivers() {
         U128(ONE_NEAR),
         U128(ONE_NEAR),
         DAY_SECS,
+        CAP,
         receivers(33),
     );
 }
 
 #[test]
-fn revoke_denies_every_later_spend_with_revoked() {
+fn revoke_emits_agent_revoked_and_check_spend_reports_revoked() {
     let mut guard = setup();
     call_as(&owner(), 1, T0_MS);
     guard.revoke(agent());
@@ -497,17 +564,23 @@ fn revoke_denies_every_later_spend_with_revoked() {
             r#"{"agent":"agent.aunova-guard.testnet"}"#
         )]
     );
-
-    call_as(&agent(), 0, T0_MS + 1_000);
     assert_eq!(
-        spend(&mut guard, vendor(), 1, 1),
-        SpendReceipt {
-            ledger_index: 0,
+        guard.check_spend(agent(), vendor(), U128(1)),
+        Decision {
             approved: false,
             reasons: vec![Revoked],
         }
     );
-    assert!(get_created_receipts().is_empty());
+}
+
+#[test]
+#[should_panic(expected = "agent revoked")]
+fn a_revoked_agent_cannot_record_anything() {
+    let mut guard = setup();
+    call_as(&owner(), 1, T0_MS);
+    guard.revoke(agent());
+    call_as(&agent(), 0, T0_MS + 1_000);
+    spend(&mut guard, vendor(), 1, 1);
 }
 
 #[test]
@@ -789,12 +862,114 @@ fn attempt_ids_are_unique_across_agents() {
         U128(ONE_NEAR),
         U128(ONE_NEAR),
         DAY_SECS,
+        CAP,
         vec![vendor()],
     );
     call_as(&agent(), 0, T0_MS);
     spend(&mut guard, vendor(), 1, 9);
     call_as(&drain(), 0, T0_MS);
     spend(&mut guard, vendor(), 1, 9);
+}
+
+// The per-window entry cap.
+
+#[test]
+fn approved_and_denied_entries_both_count_against_the_window() {
+    let mut guard = set_entry_cap(2);
+    call_as(&agent(), 0, T0_MS + 1_000);
+    assert!(spend(&mut guard, vendor(), 1, 1).approved);
+    assert_eq!(entries(&guard), 1);
+    assert!(!spend(&mut guard, drain(), 1, 2).approved);
+    assert_eq!(entries(&guard), 2);
+}
+
+#[test]
+#[should_panic(expected = "window entry cap reached")]
+fn a_full_window_refuses_further_requests() {
+    let mut guard = set_entry_cap(2);
+    call_as(&agent(), 0, T0_MS + 1_000);
+    spend(&mut guard, vendor(), 1, 1);
+    spend(&mut guard, drain(), 1, 2);
+    spend(&mut guard, drain(), 1, 3);
+}
+
+#[test]
+fn the_entry_count_resets_when_the_window_rolls() {
+    let mut guard = set_entry_cap(2);
+    call_as(&agent(), 0, T0_MS + 1_000);
+    spend(&mut guard, vendor(), 1, 1);
+    spend(&mut guard, drain(), 1, 2);
+    // The window started at T0 and lasts a day; this request rolls it before the cap is checked.
+    call_as(&agent(), 0, T0_MS + DAY_MS);
+    assert!(spend(&mut guard, vendor(), 1, 3).approved);
+    assert_eq!(entries(&guard), 1);
+    assert_eq!(window(&guard).0, T0_MS + DAY_MS);
+}
+
+#[test]
+#[should_panic(expected = "window entry cap reached")]
+fn lowering_the_cap_below_the_count_refuses_until_the_window_rolls() {
+    let mut guard = set_entry_cap(3);
+    call_as(&agent(), 0, T0_MS + 1_000);
+    spend(&mut guard, vendor(), 1, 1);
+    spend(&mut guard, drain(), 1, 2);
+    call_as(&owner(), 1, T0_MS + 2_000);
+    guard.set_policy(
+        agent(),
+        U128(HALF_NEAR),
+        U128(ONE_NEAR),
+        DAY_SECS,
+        1,
+        vec![vendor()],
+    );
+    call_as(&agent(), 0, T0_MS + 3_000);
+    spend(&mut guard, vendor(), 1, 3);
+}
+
+#[test]
+fn max_entry_storage_bytes_is_the_measured_worst_case() {
+    // The longest agent and receiver ids (64 characters), the longest memo (256 bytes) and the
+    // most reasons a recorded entry can carry.
+    let long_agent = account(&"a".repeat(64));
+    call_as(&vault(), 0, T0_MS);
+    let mut guard = AgentGuard::new(owner());
+    call_as(&owner(), 1, T0_MS);
+    guard.set_policy(
+        long_agent.clone(),
+        U128(1),
+        U128(1),
+        DAY_SECS,
+        CAP,
+        vec![vendor()],
+    );
+    // Write out everything cached so far, so the delta below is the entry alone.
+    guard.policies.flush();
+    guard.ledger.flush();
+
+    call_as(&long_agent, 0, T0_MS + 1_000);
+    let before = env::storage_usage();
+    let receipt = guard.request_spend(
+        account(&"f".repeat(64)),
+        U128(u128::MAX),
+        attempt(1),
+        Some("x".repeat(256)),
+    );
+    assert_eq!(
+        receipt.reasons,
+        [
+            ReceiverNotAllowed,
+            OverPerTxMax,
+            OverWindowLimit,
+            InsufficientVaultBalance
+        ]
+    );
+    guard.policies.flush();
+    guard.ledger.flush();
+    assert_eq!(env::storage_usage() - before, MAX_ENTRY_STORAGE_BYTES);
+    assert_eq!(
+        AgentGuard::max_entry_storage_bytes(),
+        MAX_ENTRY_STORAGE_BYTES
+    );
 }
 
 // Ledger pagination.
@@ -938,6 +1113,7 @@ fn insufficient_vault_balance_uses_the_vault_available_figure() {
         U128(u128::MAX),
         U128(u128::MAX),
         DAY_SECS,
+        CAP,
         vec![vendor()],
     );
 

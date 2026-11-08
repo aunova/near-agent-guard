@@ -4,16 +4,25 @@ use near_sdk::json_types::U128;
 use near_sdk::{AccountId, near};
 
 /// One agent's spending policy, exactly as `get_policy` returns it.
+///
+/// The window is fixed, not sliding: the first starts when the policy is created, each later one
+/// at the first request after the previous one ended, and each lasts `window_secs`. Up to twice
+/// `window_limit` can therefore leave across a window boundary.
 #[near(serializers = [borsh, json])]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Policy {
     pub per_tx_max: U128,
     pub window_limit: U128,
     pub window_secs: u64,
+    /// Most ledger entries, approved or denied, the agent may add per window (1..=1000). Bounds
+    /// the storage the vault pays for one agent's requests.
+    pub max_entries_per_window: u32,
     pub allowed_receivers: Vec<AccountId>,
     pub revoked: bool,
     pub window_start_ms: u64,
     pub window_spent: U128,
+    /// Ledger entries added in the current window.
+    pub window_entries: u32,
 }
 
 /// Why a spend is refused. A decision lists every reason that applies, in declaration order.
@@ -23,6 +32,7 @@ pub struct Policy {
 pub enum DenyReason {
     /// Only `check_spend` reports this; `request_spend` panics for an unknown agent instead.
     UnknownAgent,
+    /// Only `check_spend` reports this; `request_spend` panics for a revoked agent instead.
     Revoked,
     ZeroAmount,
     ReceiverNotAllowed,

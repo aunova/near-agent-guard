@@ -8,7 +8,7 @@
 
 use std::error::Error;
 
-use agent_guard::types::{DenyReason, LedgerEntry, Policy, SpendReceipt, TransferStatus};
+use agent_guard::types::{Decision, DenyReason, LedgerEntry, Policy, SpendReceipt, TransferStatus};
 use near_jsonrpc_client::errors::{JsonRpcError, JsonRpcServerError};
 use near_jsonrpc_client::methods::broadcast_tx_commit::RpcTransactionError;
 use near_primitives::errors::{
@@ -31,6 +31,10 @@ const HALF_NEAR: u128 = ONE_NEAR / 2;
 /// The gas the bridge attaches to `request_spend`.
 const SPEND_GAS: Gas = Gas::from_tgas(50);
 const MEMO: &str = "INV-2026-11-001";
+/// `max_entries_per_window` of the scenario policies; only the griefing test reaches a cap.
+const ENTRY_CAP: u32 = 100;
+/// yoctoNEAR per byte of storage (`env::storage_byte_cost`).
+const STORAGE_BYTE_COST: u128 = 10u128.pow(19);
 
 fn contract_wasm() -> Vec<u8> {
     std::fs::read(WASM).unwrap_or_else(|err| {
@@ -64,15 +68,55 @@ async fn subaccount(parent: &Account, name: &str, near: u128) -> TestResult<Acco
         .into_result()?)
 }
 
-/// Creates `<name>.<root>` holding 20 NEAR and deploys the contract to it, uninitialized.
-async fn deploy_uninitialized(root: &Account, name: &str) -> TestResult<Contract> {
-    let account = subaccount(root, name, 20).await?;
+/// Creates `<name>.<root>` holding `near` NEAR and deploys the contract to it, uninitialized.
+async fn deploy_uninitialized(root: &Account, name: &str, near: u128) -> TestResult<Contract> {
+    let account = subaccount(root, name, near).await?;
     Ok(account.deploy(&contract_wasm()).await?.into_result()?)
 }
 
+/// Adds a function-call key (receiver = the vault, methods = `["request_spend"]`, `allowance`) to
+/// `agent_full_access` and returns the agent signing with that key only. Its full-access key is
+/// used once, here, and then dropped.
+async fn function_call_key(
+    worker: &Worker<Sandbox>,
+    agent_full_access: &Account,
+    vault: &Contract,
+    allowance: NearToken,
+) -> TestResult<Account> {
+    let key = SecretKey::from_random(KeyType::ED25519);
+    agent_full_access
+        .batch(agent_full_access.id())
+        .add_key(
+            key.public_key(),
+            AccessKey::function_call_access(vault.id(), &["request_spend"], Some(allowance)),
+        )
+        .transact()
+        .await?
+        .into_result()?;
+    let agent = Account::from_secret_key(agent_full_access.id().clone(), key, worker);
+
+    // The key the agent signs with really is the restricted one.
+    let view = agent
+        .view_access_key(&agent.secret_key().public_key())
+        .await?;
+    match view.permission {
+        AccessKeyPermission::FunctionCall(permission) => {
+            assert_eq!(permission.receiver_id, vault.id().as_str());
+            assert_eq!(permission.method_names, ["request_spend"]);
+            assert_eq!(
+                permission.allowance,
+                Some(allowance),
+                "a finite gas allowance"
+            );
+        }
+        AccessKeyPermission::FullAccess => panic!("the agent must not sign with a full-access key"),
+    }
+    Ok(agent)
+}
+
 /// Owner, vendor, drain, an initialized vault, and an agent whose policy allows 0.5 NEAR per
-/// transaction and 1 NEAR per day to the vendor only. The returned agent signs with a fresh
-/// function-call key; its full-access key is used once, to add that key, and then dropped.
+/// transaction, 1 NEAR and `ENTRY_CAP` entries per day, to the vendor only. The agent signs with
+/// a function-call key holding a 1 NEAR allowance.
 async fn setup() -> TestResult<Scene> {
     let worker = near_workspaces::sandbox().await?;
     let root = worker.root_account()?;
@@ -81,7 +125,7 @@ async fn setup() -> TestResult<Scene> {
     let drain = subaccount(&root, "drain", 5).await?;
     let agent_full_access = subaccount(&root, "agent", 5).await?;
 
-    let vault = deploy_uninitialized(&root, "vault").await?;
+    let vault = deploy_uninitialized(&root, "vault", 20).await?;
     vault
         .call("new")
         .args_json(json!({ "owner": owner.id() }))
@@ -94,43 +138,13 @@ async fn setup() -> TestResult<Scene> {
         agent_full_access.id(),
         HALF_NEAR,
         ONE_NEAR,
+        ENTRY_CAP,
         &[vendor.id()],
     )
     .await?
     .into_result()?;
-
-    let function_call_key = SecretKey::from_random(KeyType::ED25519);
-    agent_full_access
-        .batch(agent_full_access.id())
-        .add_key(
-            function_call_key.public_key(),
-            AccessKey::function_call_access(
-                vault.id(),
-                &["request_spend"],
-                Some(NearToken::from_near(1)),
-            ),
-        )
-        .transact()
-        .await?
-        .into_result()?;
     let agent =
-        Account::from_secret_key(agent_full_access.id().clone(), function_call_key, &worker);
-
-    // The key the agent signs with really is the restricted one.
-    let key = agent
-        .view_access_key(&agent.secret_key().public_key())
-        .await?;
-    match key.permission {
-        AccessKeyPermission::FunctionCall(permission) => {
-            assert_eq!(permission.receiver_id, vault.id().as_str());
-            assert_eq!(permission.method_names, ["request_spend"]);
-            assert!(
-                permission.allowance.is_some(),
-                "the agent key has a finite gas allowance"
-            );
-        }
-        AccessKeyPermission::FullAccess => panic!("the agent must not sign with a full-access key"),
-    }
+        function_call_key(&worker, &agent_full_access, &vault, NearToken::from_near(1)).await?;
 
     Ok(Scene {
         worker,
@@ -149,6 +163,7 @@ async fn set_policy(
     agent: &AccountId,
     per_tx_max: u128,
     window_limit: u128,
+    max_entries_per_window: u32,
     receivers: &[&AccountId],
 ) -> TestResult<ExecutionFinalResult> {
     Ok(owner
@@ -158,6 +173,7 @@ async fn set_policy(
             "per_tx_max": U128(per_tx_max),
             "window_limit": U128(window_limit),
             "window_secs": 86_400,
+            "max_entries_per_window": max_entries_per_window,
             "allowed_receivers": receivers,
         }))
         .deposit(NearToken::from_yoctonear(1))
@@ -214,9 +230,13 @@ async fn agent_policy(scene: &Scene) -> TestResult<Policy> {
     Ok(policy.ok_or("agent has no policy")?)
 }
 
-async fn vault_available(scene: &Scene) -> TestResult<u128> {
-    let available: U128 = scene.vault.view("vault_available").await?.json()?;
+async fn vault_available(vault: &Contract) -> TestResult<u128> {
+    let available: U128 = vault.view("vault_available").await?.json()?;
     Ok(available.0)
+}
+
+async fn storage_usage(worker: &Worker<Sandbox>, vault: &Contract) -> TestResult<u64> {
+    Ok(worker.view_account(vault.id()).await?.storage_usage)
 }
 
 /// The verdict of a transaction the node refused to accept at all. Panics on any other failure.
@@ -363,6 +383,7 @@ async fn scenario_3_function_call_key_cannot_call_set_policy() -> TestResult {
         "per_tx_max": U128(100 * ONE_NEAR),
         "window_limit": U128(100 * ONE_NEAR),
         "window_secs": 86_400,
+        "max_entries_per_window": ENTRY_CAP,
         "allowed_receivers": [scene.drain.id()],
     });
 
@@ -473,6 +494,7 @@ async fn scenario_5_owner_set_policy_requires_exactly_one_yocto() -> TestResult 
         "per_tx_max": U128(ONE_NEAR),
         "window_limit": U128(2 * ONE_NEAR),
         "window_secs": 86_400,
+        "max_entries_per_window": ENTRY_CAP,
         "allowed_receivers": [scene.vendor.id()],
     });
 
@@ -528,6 +550,7 @@ async fn scenario_6_failed_transfer_is_marked_failed_and_refunded() -> TestResul
         scene.agent.id(),
         HALF_NEAR,
         ONE_NEAR,
+        ENTRY_CAP,
         &[scene.vendor.id(), &ghost],
     )
     .await?
@@ -579,7 +602,7 @@ async fn scenario_7_duplicate_attempt_id_panics_and_records_nothing() -> TestRes
 }
 
 #[tokio::test]
-async fn scenario_8_revoked_agent_is_denied() -> TestResult {
+async fn scenario_8_revoked_agent_is_refused_and_stores_nothing() -> TestResult {
     let scene = setup().await?;
     scene
         .owner
@@ -590,29 +613,44 @@ async fn scenario_8_revoked_agent_is_denied() -> TestResult {
         .await?
         .into_result()?;
     let vendor_before = balance(&scene.vendor).await?;
+    let storage_before = storage_usage(&scene.worker, &scene.vault).await?;
 
-    let receipt: SpendReceipt =
-        request_spend(&scene, scene.vendor.id(), ONE_NEAR / 10, &attempt(8))
-            .await?
-            .json()?;
+    let outcome = request_spend(&scene, scene.vendor.id(), ONE_NEAR / 10, &attempt(8)).await?;
+    let message = contract_panic(&outcome);
+    println!("[scenario 8] revoked agent's request_spend FAILED: {message}");
+    assert_eq!(message, "Smart contract panicked: agent revoked");
+    assert_eq!(ledger_len(&scene).await?, 0, "no ledger entry");
     assert_eq!(
-        receipt,
-        SpendReceipt {
-            ledger_index: 0,
-            approved: false,
-            reasons: vec![DenyReason::Revoked],
-        }
+        storage_usage(&scene.worker, &scene.vault).await?,
+        storage_before,
+        "the vault stores nothing for a revoked agent"
     );
     assert_eq!(
         balance(&scene.vendor).await?,
         vendor_before,
         "vendor receives nothing"
     );
-    let entry = ledger_entry(&scene, 0).await?;
-    assert_eq!(entry.reasons, [DenyReason::Revoked]);
+
+    let decision: Decision = scene
+        .vault
+        .view("check_spend")
+        .args_json(json!({
+            "agent": scene.agent.id(),
+            "receiver": scene.vendor.id(),
+            "amount": U128(ONE_NEAR / 10),
+        }))
+        .await?
+        .json()?;
+    assert_eq!(
+        decision,
+        Decision {
+            approved: false,
+            reasons: vec![DenyReason::Revoked],
+        }
+    );
     println!(
-        "[scenario 8] revoked agent denied: ledger[0] = {}",
-        serde_json::to_string(&entry)?
+        "[scenario 8] check_spend still reports: {}",
+        serde_json::to_string(&decision)?
     );
     Ok(())
 }
@@ -623,7 +661,7 @@ async fn a_third_party_cannot_initialize_the_vault() -> TestResult {
     let root = worker.root_account()?;
     let owner = subaccount(&root, "owner", 5).await?;
     let stranger = subaccount(&root, "stranger", 5).await?;
-    let vault = deploy_uninitialized(&root, "vault").await?;
+    let vault = deploy_uninitialized(&root, "vault", 20).await?;
 
     let outcome = stranger
         .call(vault.id(), "new")
@@ -650,7 +688,7 @@ async fn owner_withdraw_moves_funds_to_the_owner() -> TestResult {
     let scene = setup().await?;
     let amount = 2 * ONE_NEAR;
     let owner_before = balance(&scene.owner).await?;
-    let available_before = vault_available(&scene).await?;
+    let available_before = vault_available(&scene.vault).await?;
 
     let outcome = scene
         .owner
@@ -679,7 +717,7 @@ async fn owner_withdraw_moves_funds_to_the_owner() -> TestResult {
         "the call costs the owner {cost} yoctoNEAR"
     );
     // Exactly `amount` leaves the vault; the attached 1 yoctoNEAR stays in it.
-    let spent = available_before - vault_available(&scene).await?;
+    let spent = available_before - vault_available(&scene.vault).await?;
     assert_eq!(spent, amount - 1, "vault_available drops by the amount");
     assert_eq!(
         ledger_len(&scene).await?,
@@ -689,5 +727,131 @@ async fn owner_withdraw_moves_funds_to_the_owner() -> TestResult {
     println!(
         "[withdraw] owner +{gained} yoctoNEAR for a {amount} yoctoNEAR withdrawal (cost {cost}: gas + 1 yoctoNEAR); vault_available -{spent}"
     );
+    Ok(())
+}
+
+/// Karl's storage-griefing probe, run against the fix. An agent's function-call key (0.5 NEAR
+/// allowance) spams denied requests with the longest agent id, receiver and memo until the vault
+/// refuses. The window entry cap bounds the storage the vault pays for, a revoked agent stores
+/// nothing, and the owner can still withdraw everything spendable from a small vault.
+#[tokio::test]
+async fn denied_request_spam_is_capped_per_window_and_the_vault_stays_usable() -> TestResult {
+    const CAP: u32 = 10;
+    let worker = near_workspaces::sandbox().await?;
+    let root = worker.root_account()?;
+    let owner = subaccount(&root, "owner", 30).await?;
+    let vendor = subaccount(&root, "vendor", 5).await?;
+    // A 64-character agent id, the longest a ledger entry can carry.
+    let rogue_name = "r".repeat(64 - root.id().as_str().len() - 1);
+    let rogue_full_access = subaccount(&root, &rogue_name, 2).await?;
+    assert_eq!(rogue_full_access.id().as_str().len(), 64);
+    // A small vault, as in the probe: about 1.2 NEAR spendable beside its code's storage stake.
+    let vault = deploy_uninitialized(&root, "vault", 3).await?;
+    vault
+        .call("new")
+        .args_json(json!({ "owner": owner.id() }))
+        .transact()
+        .await?
+        .into_result()?;
+    set_policy(
+        &owner,
+        &vault,
+        rogue_full_access.id(),
+        ONE_NEAR / 10,
+        ONE_NEAR,
+        CAP,
+        &[vendor.id()],
+    )
+    .await?
+    .into_result()?;
+    let rogue = function_call_key(
+        &worker,
+        &rogue_full_access,
+        &vault,
+        NearToken::from_millinear(500),
+    )
+    .await?;
+
+    let storage_before = storage_usage(&worker, &vault).await?;
+    let available_before = vault_available(&vault).await?;
+    let (receiver, memo) = ("f".repeat(64), "x".repeat(256));
+    let spam = |n: u64| {
+        rogue
+            .call(vault.id(), "request_spend")
+            .args_json(json!({
+                "receiver": receiver,
+                "amount": U128(u128::MAX),
+                "attempt_id": attempt(50_000 + n),
+                "memo": memo,
+            }))
+            .gas(SPEND_GAS)
+            .transact()
+    };
+    let mut recorded: u32 = 0;
+    let mut refusal = None;
+    for n in 0..=u64::from(CAP) {
+        let outcome = spam(n).await?;
+        if outcome.is_success() {
+            let receipt: SpendReceipt = outcome.json()?;
+            assert!(
+                !receipt.approved,
+                "every spam request is denied: {receipt:?}"
+            );
+            recorded += 1;
+        } else {
+            refusal = Some(contract_panic(&outcome));
+            break;
+        }
+    }
+    println!("[storage griefing] {recorded} denied entries recorded, then: {refusal:?}");
+    let refusal = refusal.ok_or("the vault never refused the spam")?;
+    assert_eq!(recorded, CAP);
+    assert_eq!(refusal, "Smart contract panicked: window entry cap reached");
+
+    let per_entry: u64 = vault.view("max_entry_storage_bytes").await?.json()?;
+    let storage_added = storage_usage(&worker, &vault).await? - storage_before;
+    let locked = available_before - vault_available(&vault).await?;
+    let bound = u128::from(CAP) * u128::from(per_entry) * STORAGE_BYTE_COST;
+    println!(
+        "[storage griefing] vault storage +{storage_added} B = {} B/entry (max_entry_storage_bytes {per_entry}); vault_available -{locked} yoctoNEAR, bound {CAP} x {per_entry} B x 10^19 = {bound}",
+        storage_added / u64::from(CAP)
+    );
+    assert_eq!(
+        storage_added,
+        u64::from(CAP) * per_entry,
+        "each worst-case entry adds exactly max_entry_storage_bytes; the refused call adds nothing"
+    );
+    assert!(
+        locked <= bound,
+        "vault_available dropped by {locked}, over the bound {bound}"
+    );
+
+    owner
+        .call(vault.id(), "revoke")
+        .args_json(json!({ "agent": rogue.id() }))
+        .deposit(NearToken::from_yoctonear(1))
+        .transact()
+        .await?
+        .into_result()?;
+    let storage_revoked = storage_usage(&worker, &vault).await?;
+    let message = contract_panic(&spam(u64::from(CAP) + 1).await?);
+    println!("[storage griefing] revoked agent's request_spend FAILED: {message}");
+    assert_eq!(message, "Smart contract panicked: agent revoked");
+    assert_eq!(
+        storage_usage(&worker, &vault).await?,
+        storage_revoked,
+        "a revoked agent stores nothing"
+    );
+
+    let spendable = vault_available(&vault).await?;
+    owner
+        .call(vault.id(), "withdraw")
+        .args_json(json!({ "amount": U128(spendable) }))
+        .deposit(NearToken::from_yoctonear(1))
+        .gas(Gas::from_tgas(30))
+        .transact()
+        .await?
+        .into_result()?;
+    println!("[storage griefing] owner withdrew all {spendable} yoctoNEAR still spendable");
     Ok(())
 }
