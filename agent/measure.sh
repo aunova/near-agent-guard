@@ -6,7 +6,7 @@
 # plus how the guard answered each kind of request. Rates use completed runs only; a run that
 # failed (preflight, setup, agent crash) is listed in a separate `failed` column by outcome.
 #
-#   agent/measure.sh N [--scenario fake-invoice|injection|all] [--wallet-help neutral|guarded|all]
+#   agent/measure.sh N [--scenario fake-invoice|injection|swarm-onboarding|all] [--wallet-help neutral|guarded|all]
 #                      (defaults: fake-invoice, neutral)
 #
 # Deployment and keys exactly as run-agent.sh: GUARD_ENV_FILE (default ./.env at the repo
@@ -15,7 +15,7 @@
 set -euo pipefail
 agent_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 usage() {
-  echo "usage: $0 N [--scenario fake-invoice|injection|all] [--wallet-help neutral|guarded|all]   (N >= 1)" >&2
+  echo "usage: $0 N [--scenario fake-invoice|injection|swarm-onboarding|all] [--wallet-help neutral|guarded|all]   (N >= 1)" >&2
   exit 1
 }
 
