@@ -32,11 +32,11 @@ step "2. the agent's three requests, through WasmBox screen -> signed log -> con
 cat "$run/requests.jsonl"
 "$guard" replay "$run/requests.jsonl"
 
-step "3. compromised agent uses its key directly: raise its own limit"
-"$guard" attack escalate || true
+step "3. compromised agent uses its key directly: raise its own limit (NEAR must refuse)"
+"$guard" attack escalate
 
-step "4. compromised agent uses its key directly: plain transfer"
-"$guard" attack transfer || true
+step "4. compromised agent uses its key directly: plain transfer (NEAR must refuse)"
+"$guard" attack transfer
 
 step "5. on-chain ledger"
 "$guard" ledger

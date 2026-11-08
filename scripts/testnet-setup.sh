@@ -35,11 +35,13 @@ vault="vault.$owner" agent="agent.$owner" vendor="vendor.$owner" attacker="north
 net=(network-config testnet)
 rpc="${NEAR_RPC_URL:-https://rpc.testnet.near.org}"
 
-exists() {
+view() { # request_type account [extra json fields] -> .result JSON; non-zero if absent or on error
   curl -s -m 15 "$rpc" -H 'Content-Type: application/json' -d \
-    "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"query\",\"params\":{\"request_type\":\"view_account\",\"finality\":\"final\",\"account_id\":\"$1\"}}" \
-    | jq -e '.result.amount' >/dev/null
+    "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"query\",\"params\":{\"request_type\":\"$1\",\"finality\":\"final\",\"account_id\":\"$2\"${3:-}}}" \
+    | jq -ec '.result // empty'
 }
+exists() { view view_account "$1" >/dev/null; }
+has_code() { [[ "$(view view_account "$1" | jq -r .code_hash)" != "11111111111111111111111111111111" ]]; }
 
 step() { printf '\n== %s\n' "$*"; }
 
@@ -68,9 +70,11 @@ wasm="contract/target/near/agent_guard.wasm"
 ls -l "$wasm"
 
 step "deploy + init on $vault"
-near contract deploy "$vault" use-file "$wasm" with-init-call new json-args "{\"owner\":\"$owner\"}" \
-  prepaid-gas '30 Tgas' attached-deposit '0 NEAR' "${net[@]}" sign-with-legacy-keychain send >/dev/null
-echo "deployed"
+if has_code "$vault"; then echo "code already deployed, reusing (init runs only once)"; else
+  near contract deploy "$vault" use-file "$wasm" with-init-call new json-args "{\"owner\":\"$owner\"}" \
+    prepaid-gas '30 Tgas' attached-deposit '0 NEAR' "${net[@]}" sign-with-legacy-keychain send >/dev/null
+  echo "deployed"
+fi
 
 step "policy for $agent: 1 NEAR per tx, 2 NEAR per 24 h, receiver $vendor only"
 near contract call-function as-transaction "$vault" set_policy json-args \
@@ -81,17 +85,22 @@ echo "policy set"
 step "function-call key for the bridge"
 keydir="$HOME/.near-credentials/near-agent-guard-fc-$owner"
 mkdir -p "$keydir" && chmod 700 "$keydir"
-near account create-account fund-later use-auto-generation save-to-folder "$keydir" >/dev/null
-keyfile="$(ls -t "$keydir"/*.json | head -1)"
-pub="$(jq -r .public_key "$keyfile")"
-near account add-key "$agent" grant-function-call-access --allowance '0.5 NEAR' \
-  --contract-account-id "$vault" --function-names request_spend use-manually-provided-public-key "$pub" \
-  "${net[@]}" sign-with-legacy-keychain send >/dev/null
-echo "added $pub: only request_spend on $vault, 0.5 NEAR gas allowance"
+keyfile="$(ls -t "$keydir"/*.json 2>/dev/null | head -1 || true)"
+if [[ -n "$keyfile" ]] && view view_access_key "$agent" ",\"public_key\":\"$(jq -r .public_key "$keyfile")\"" >/dev/null; then
+  echo "reusing $(jq -r .public_key "$keyfile"), already on $agent"
+else
+  near account create-account fund-later use-auto-generation save-to-folder "$keydir" >/dev/null
+  keyfile="$(ls -t "$keydir"/*.json | head -1)"
+  pub="$(jq -r .public_key "$keyfile")"
+  near account add-key "$agent" grant-function-call-access --allowance '0.5 NEAR' \
+    --contract-account-id "$vault" --function-names request_spend use-manually-provided-public-key "$pub" \
+    "${net[@]}" sign-with-legacy-keychain send >/dev/null
+  echo "added $pub: only request_spend on $vault, 0.5 NEAR gas allowance"
+fi
 
 step "spend-screen.wasm + bridge"
 (cd tools/spend-screen && cargo build --release --target wasm32-wasip2 >/dev/null)
-screen="$here/tools/spend-screen/target/wasm32-wasip2/release/spend_screen.wasm"
+screen="$here/tools/spend-screen/target/wasm32-wasip2/release/spend-screen.wasm"
 screen_sha="$(sha256sum "$screen" | cut -d' ' -f1)"
 (cd bridge && cargo build --release >/dev/null)
 guard="$here/bridge/target/release/guard"
